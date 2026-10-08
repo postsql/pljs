@@ -2459,7 +2459,8 @@ static void call_anonymous_function(const char *source, JSContext *ctx) {
 
   char do_name[64];
   snprintf(do_name, sizeof(do_name), "<do_%lu>", (unsigned long)(++do_counter));
-  JSValue val = JS_Eval(ctx, src.data, strlen(src.data), do_name,
+  JSValue val = JS_Eval(ctx, src.data, strlen(src.data),
+                        has_imports ? do_name : "<function>",
                         has_imports ? JS_EVAL_TYPE_MODULE : 0);
 
   if (!JS_IsException(val)) {
@@ -3675,7 +3676,11 @@ uint64 pljs_tle_modules_fingerprint(void) {
     pushed = true;
   }
 
+#if PG_VERSION_NUM >= 190000
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+#else
   TableScanDesc scan = table_beginscan(rel, snap, 0, NULL);
+#endif
   TupleTableSlot *slot = table_slot_create(rel, NULL);
 
   while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
@@ -3845,7 +3850,11 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
     pushed = true;
   }
 
+#if PG_VERSION_NUM >= 190000
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+#else
   TableScanDesc scan = table_beginscan(rel, snap, 0, NULL);
+#endif
   TupleTableSlot *slot = table_slot_create(rel, NULL);
 
   bool found = false;
@@ -3885,14 +3894,39 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
       }
     }
 
-    Datum d_fmt = slot_getattr(slot, 3, &isnull);
-    char *c_fmt = isnull ? pstrdup("esm") : TextDatumGetCString(d_fmt);
+    char *c_fmt = NULL;
+    char *c_src = NULL;
+    bytea *c_bc = NULL;
+    bool is_pgtle_schema =
+        (tupdesc->natts >= 4 &&
+         strcmp(NameStr(TupleDescAttr(tupdesc, 2)->attname), "source_code") ==
+             0);
 
-    Datum d_src = slot_getattr(slot, 4, &isnull);
-    char *c_src = isnull ? NULL : TextDatumGetCString(d_src);
+    if (is_pgtle_schema) {
+      Datum d_src = slot_getattr(slot, 3, &isnull);
+      c_src = isnull ? NULL : TextDatumGetCString(d_src);
 
-    Datum d_bc = slot_getattr(slot, 5, &isnull);
-    bytea *c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+      Datum d_bc = slot_getattr(slot, 4, &isnull);
+      c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+
+      if (c_bc != NULL) {
+        c_fmt = pstrdup("bytecode");
+      } else if (c_src != NULL && strstr(c_src, "exports.") != NULL &&
+                 strstr(c_src, "export ") == NULL) {
+        c_fmt = pstrdup("cjs");
+      } else {
+        c_fmt = pstrdup("esm");
+      }
+    } else {
+      Datum d_fmt = slot_getattr(slot, 3, &isnull);
+      c_fmt = isnull ? pstrdup("esm") : TextDatumGetCString(d_fmt);
+
+      Datum d_src = slot_getattr(slot, 4, &isnull);
+      c_src = isnull ? NULL : TextDatumGetCString(d_src);
+
+      Datum d_bc = slot_getattr(slot, 5, &isnull);
+      c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+    }
 
     if (best_ver) {
       pfree(best_ver);

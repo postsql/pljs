@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/table.h"
 #include "catalog/namespace.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"

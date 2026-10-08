@@ -45,7 +45,7 @@ static Oid get_pljs_module_index_relid(void) {
   return get_relname_relid("pljs_modules_path", get_pljs_schema_oid());
 }
 
-static uint8_t *pljs_read_module(size_t *pbuf_len, const char *filename) {
+uint8_t *pljs_read_module(size_t *pbuf_len, const char *filename) {
   // Initialize any return data.
   uint8_t *ret = NULL;
   *pbuf_len = 0;
@@ -61,9 +61,17 @@ static uint8_t *pljs_read_module(size_t *pbuf_len, const char *filename) {
   Relation table = table_open(get_pljs_module_relid(), AccessShareLock);
   Relation index = index_open(get_pljs_module_index_relid(), AccessShareLock);
 
+  Snapshot snap = GetActiveSnapshot();
+  bool pushed = false;
+  if (snap == NULL) {
+    PushActiveSnapshot(GetTransactionSnapshot());
+    snap = GetActiveSnapshot();
+    pushed = true;
+  }
+
   /* Set up the scan. */
   SysScanDesc scan_descriptor =
-      systable_beginscan_ordered(table, index, GetActiveSnapshot(), 1, scankey);
+      systable_beginscan_ordered(table, index, snap, 1, scankey);
 
   HeapTuple tuple =
       systable_getnext_ordered(scan_descriptor, ForwardScanDirection);
@@ -88,8 +96,21 @@ static uint8_t *pljs_read_module(size_t *pbuf_len, const char *filename) {
   }
 
   systable_endscan_ordered(scan_descriptor);
+  if (pushed) {
+    PopActiveSnapshot();
+  }
   index_close(index, AccessShareLock);
   table_close(table, AccessShareLock);
+
+  if (ret != NULL) {
+    pljs_encoding_init();
+    char *utf8 = pljs_server_to_utf8((char *)ret, *pbuf_len);
+    if (utf8 != (char *)ret) {
+      pfree(ret);
+      ret = (uint8_t *)utf8;
+      *pbuf_len = strlen(utf8);
+    }
+  }
 
   return ret;
 }

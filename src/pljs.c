@@ -3684,6 +3684,7 @@ uint64 pljs_tle_modules_fingerprint(void) {
   TupleTableSlot *slot = table_slot_create(rel, NULL);
 
   while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    CHECK_FOR_INTERRUPTS();
     bool should_free = false;
     HeapTuple tup = ExecFetchSlotHeapTuple(slot, false, &should_free);
     TransactionId xmin = HeapTupleHeaderGetRawXmin(tup->t_data);
@@ -3713,6 +3714,10 @@ uint64 pljs_tle_modules_fingerprint(void) {
  * @brief Extracts top-level ES module `import ...` statements from a function
  * body so they can be hoisted above the generated `function proname(...)`
  * wrapper when evaluating with `JS_EVAL_TYPE_MODULE`.
+ *
+ * Properly tracks string/template literals and single/multi-line comments so
+ * semicolons or newlines inside strings/comments do not prematurely terminate
+ * an `import` statement (JS-4).
  */
 bool pljs_extract_static_imports(const char *source, StringInfo imports_out,
                                  StringInfo body_out) {
@@ -3724,16 +3729,46 @@ bool pljs_extract_static_imports(const char *source, StringInfo imports_out,
   const char *p = source;
 
   while (*p != '\0') {
-    const char *line_start = p;
-    while (*p == ' ' || *p == '\t' || *p == '\r') {
-      p++;
+    const char *ws_start = p;
+    while (*p != '\0') {
+      if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+        p++;
+      } else if (p[0] == '/' && p[1] == '/') {
+        p += 2;
+        while (*p != '\0' && *p != '\n') {
+          p++;
+        }
+      } else if (p[0] == '/' && p[1] == '*') {
+        p += 2;
+        while (*p != '\0' && !(p[0] == '*' && p[1] == '/')) {
+          p++;
+        }
+        if (*p != '\0') {
+          p += 2;
+        }
+      } else {
+        break;
+      }
     }
 
     if (strncmp(p, "import", 6) == 0 &&
-        (p[6] == ' ' || p[6] == '\t' || p[6] == '{' || p[6] == '*' ||
-         p[6] == '"' || p[6] == '\'')) {
+        (p[6] == ' ' || p[6] == '\t' || p[6] == '\r' || p[6] == '\n' ||
+         p[6] == '{' || p[6] == '*' || p[6] == '"' || p[6] == '\'') &&
+        p[6] != '(' && p[6] != '.') {
+      const char *after_kw = p + 6;
+      while (*after_kw == ' ' || *after_kw == '\t' || *after_kw == '\r' ||
+             *after_kw == '\n') {
+        after_kw++;
+      }
+      if (*after_kw == '(' || *after_kw == '.') {
+        appendStringInfoString(body_out, ws_start);
+        break;
+      }
+
       const char *stmt_start = p;
       char quote = 0;
+      int brace_depth = 0;
+      bool saw_module_str = false;
       while (*p != '\0') {
         if (quote != 0) {
           if (*p == '\\' && p[1] != '\0') {
@@ -3742,42 +3777,158 @@ bool pljs_extract_static_imports(const char *source, StringInfo imports_out,
           }
           if (*p == quote) {
             quote = 0;
+            if (brace_depth == 0) {
+              saw_module_str = true;
+            }
           }
           p++;
-        } else {
-          if (*p == '\'' || *p == '"') {
-            quote = *p++;
-          } else if (*p == ';') {
-            p++;
-            break;
-          } else if (*p == '\n') {
-            /* Check if we already saw 'from' or string literal */
-            break;
-          } else {
+        } else if (p[0] == '/' && p[1] == '/') {
+          p += 2;
+          while (*p != '\0' && *p != '\n') {
             p++;
           }
+        } else if (p[0] == '/' && p[1] == '*') {
+          p += 2;
+          while (*p != '\0' && !(p[0] == '*' && p[1] == '/')) {
+            p++;
+          }
+          if (*p != '\0') {
+            p += 2;
+          }
+        } else if (*p == '\'' || *p == '"' || *p == '`') {
+          quote = *p++;
+        } else if (*p == '{') {
+          brace_depth++;
+          p++;
+        } else if (*p == '}') {
+          if (brace_depth > 0) {
+            brace_depth--;
+          }
+          p++;
+        } else if (*p == ';' && brace_depth == 0) {
+          p++;
+          break;
+        } else if (*p == '\n' && saw_module_str && brace_depth == 0) {
+          p++;
+          break;
+        } else {
+          p++;
         }
       }
+
+      if (p > ws_start && ws_start < stmt_start) {
+        appendBinaryStringInfo(body_out, ws_start, stmt_start - ws_start);
+      }
       appendBinaryStringInfo(imports_out, stmt_start, p - stmt_start);
-      appendStringInfoChar(imports_out, '\n');
-      if (*p == '\n') {
-        p++;
+      if (imports_out->len == 0 ||
+          imports_out->data[imports_out->len - 1] != '\n') {
+        appendStringInfoChar(imports_out, '\n');
       }
       found_any = true;
     } else {
-      p = line_start;
-      const char *eol = strchr(p, '\n');
-      if (eol) {
-        appendBinaryStringInfo(body_out, p, (eol - p) + 1);
-        p = eol + 1;
-      } else {
-        appendStringInfoString(body_out, p);
-        break;
-      }
+      appendStringInfoString(body_out, ws_start);
+      break;
     }
   }
 
   return found_any;
+}
+
+static const char *pljs_current_cjs_module_name = NULL;
+
+static JSValue pljs_throw_coded_error(JSContext *ctx, int sqlerrcode,
+                                      const char *msg) {
+  JSValue err = JS_NewError(ctx);
+  if (!JS_IsException(err)) {
+    JS_DefinePropertyValueStr(ctx, err, "message",
+                              JS_NewString(ctx, msg ? msg : "error"),
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    if (sqlerrcode != 0) {
+      JS_DefinePropertyValueStr(ctx, err, "sqlstate",
+                                JS_NewString(ctx, unpack_sql_state(sqlerrcode)),
+                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    }
+  }
+  return JS_Throw(ctx, err);
+}
+
+/**
+ * @brief Resolves a relative module path (`./...` or `../...`) against a base
+ * module name (stripping any `@version` or `#fp=...` suffix on the base).
+ * Sets `*escaped_root_out = true` if `..` segments traverse above the root.
+ */
+static char *pljs_resolve_relative_specifier(const char *base_name,
+                                             const char *rel_spec,
+                                             bool *escaped_root_out) {
+  if (escaped_root_out != NULL) {
+    *escaped_root_out = false;
+  }
+
+  StringInfoData combined;
+  initStringInfo(&combined);
+
+  if (base_name != NULL && base_name[0] != '\0' && base_name[0] != '<') {
+    const char *b = base_name;
+    if (strncmp(b, "tle://", 6) == 0) {
+      b += 6;
+    } else if (strncmp(b, "tle:", 4) == 0) {
+      b += 4;
+    } else if (strncmp(b, "pgtle:", 6) == 0) {
+      b += 6;
+    }
+
+    const char *hash_sep = strchr(b, '#');
+    size_t b_len = hash_sep ? (size_t)(hash_sep - b) : strlen(b);
+    char *base_clean = pnstrdup(b, b_len);
+    char *at_sep = strrchr(base_clean, '@');
+    if (at_sep != NULL && at_sep > base_clean) {
+      *at_sep = '\0';
+    }
+
+    char *last_slash = strrchr(base_clean, '/');
+    if (last_slash != NULL) {
+      appendBinaryStringInfo(&combined, base_clean,
+                             (last_slash - base_clean) + 1);
+    }
+    pfree(base_clean);
+  }
+
+  appendStringInfoString(&combined, rel_spec);
+
+  char *segs[64];
+  int nsegs = 0;
+  char *tok_buf = pstrdup(combined.data);
+  pfree(combined.data);
+
+  char *saveptr = NULL;
+  for (char *tok = strtok_r(tok_buf, "/", &saveptr); tok != NULL;
+       tok = strtok_r(NULL, "/", &saveptr)) {
+    if (strcmp(tok, ".") == 0 || tok[0] == '\0') {
+      continue;
+    } else if (strcmp(tok, "..") == 0) {
+      if (nsegs == 0) {
+        if (escaped_root_out != NULL) {
+          *escaped_root_out = true;
+        }
+        pfree(tok_buf);
+        return NULL;
+      }
+      nsegs--;
+    } else if (nsegs < 64) {
+      segs[nsegs++] = tok;
+    }
+  }
+
+  StringInfoData norm;
+  initStringInfo(&norm);
+  for (int i = 0; i < nsegs; i++) {
+    if (i > 0) {
+      appendStringInfoChar(&norm, '/');
+    }
+    appendStringInfoString(&norm, segs[i]);
+  }
+  pfree(tok_buf);
+  return norm.data;
 }
 
 /**
@@ -3811,14 +3962,179 @@ static void pljs_parse_tle_specifier(const char *specifier, char **name_out,
   pfree(clean);
 }
 
+static int pljs_find_attnum(TupleDesc tupdesc, const char *attname) {
+  for (int i = 0; i < tupdesc->natts; i++) {
+    Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+    if (!attr->attisdropped && strcmp(NameStr(attr->attname), attname) == 0) {
+      return i + 1;
+    }
+  }
+  return 0;
+}
+
+/**
+ * @brief Verifies that if `importer_spec` corresponds to a row in
+ * `pgtle.modules` that has a non-NULL `requires` `text[]` allowlist, the
+ * target module (`req_name` or `req_name@req_ver`) appears in `requires`.
+ */
+static bool pljs_check_importer_requires(Relation rel, TupleDesc tupdesc,
+                                         Snapshot snap, int att_name,
+                                         int att_ver, int att_requires,
+                                         const char *importer_spec,
+                                         const char *target_name,
+                                         const char *target_ver,
+                                         int *errcode_out, char **errmsg_out) {
+  if (att_requires <= 0 || importer_spec == NULL || importer_spec[0] == '\0' ||
+      importer_spec[0] == '<') {
+    return true;
+  }
+
+  char *imp_name = NULL;
+  char *imp_ver = NULL;
+  pljs_parse_tle_specifier(importer_spec, &imp_name, &imp_ver);
+
+#if PG_VERSION_NUM >= 190000
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL, SO_NONE);
+#else
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL);
+#endif
+  TupleTableSlot *slot = table_slot_create(rel, NULL);
+
+  char *best_imp_ver = NULL;
+  ArrayType *best_req_arr = NULL;
+  bool has_requires = false;
+
+  while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    CHECK_FOR_INTERRUPTS();
+    bool isnull = false;
+    Datum d_name = slot_getattr(slot, att_name, &isnull);
+    if (isnull) {
+      continue;
+    }
+    char *c_name = TextDatumGetCString(d_name);
+    if (strcmp(c_name, imp_name) != 0) {
+      pfree(c_name);
+      continue;
+    }
+    pfree(c_name);
+
+    Datum d_ver = slot_getattr(slot, att_ver, &isnull);
+    if (isnull) {
+      continue;
+    }
+    char *c_ver = TextDatumGetCString(d_ver);
+    if (imp_ver != NULL) {
+      if (strcmp(c_ver, imp_ver) != 0) {
+        pfree(c_ver);
+        continue;
+      }
+    } else if (best_imp_ver != NULL &&
+               pljs_compare_semver(c_ver, best_imp_ver) <= 0) {
+      pfree(c_ver);
+      continue;
+    }
+
+    if (best_imp_ver != NULL) {
+      pfree(best_imp_ver);
+    }
+    best_imp_ver = c_ver;
+
+    if (best_req_arr != NULL) {
+      pfree(best_req_arr);
+      best_req_arr = NULL;
+    }
+    Datum d_req = slot_getattr(slot, att_requires, &isnull);
+    if (!isnull) {
+      best_req_arr = DatumGetArrayTypePCopy(d_req);
+      has_requires = true;
+    } else {
+      has_requires = false;
+    }
+
+    if (imp_ver != NULL) {
+      break;
+    }
+  }
+
+  ExecDropSingleTupleTableSlot(slot);
+  table_endscan(scan);
+
+  bool ok = true;
+  if (has_requires && best_req_arr != NULL) {
+    Datum *elems = NULL;
+    bool *nulls = NULL;
+    int nelems = 0;
+    deconstruct_array(best_req_arr, TEXTOID, -1, false, TYPALIGN_INT, &elems,
+                      &nulls, &nelems);
+    bool allowed = false;
+    for (int i = 0; i < nelems; i++) {
+      if (nulls[i]) {
+        continue;
+      }
+      char *entry = TextDatumGetCString(elems[i]);
+      char *e_name = NULL;
+      char *e_ver = NULL;
+      pljs_parse_tle_specifier(entry, &e_name, &e_ver);
+      if (strcmp(e_name, target_name) == 0 &&
+          (e_ver == NULL || target_ver == NULL ||
+           strcmp(e_ver, target_ver) == 0)) {
+        allowed = true;
+      }
+      pfree(e_name);
+      if (e_ver) {
+        pfree(e_ver);
+      }
+      pfree(entry);
+      if (allowed) {
+        break;
+      }
+    }
+    if (elems) {
+      pfree(elems);
+    }
+    if (nulls) {
+      pfree(nulls);
+    }
+    pfree(best_req_arr);
+
+    if (!allowed) {
+      if (errcode_out != NULL) {
+        *errcode_out = ERRCODE_INSUFFICIENT_PRIVILEGE;
+      }
+      if (errmsg_out != NULL) {
+        *errmsg_out = psprintf(
+            "pg_tle module \"%s\" is not listed in requires of \"%s\"",
+            target_name, imp_name);
+      }
+      ok = false;
+    }
+  }
+
+  if (best_imp_ver) {
+    pfree(best_imp_ver);
+  }
+  pfree(imp_name);
+  if (imp_ver) {
+    pfree(imp_ver);
+  }
+  return ok;
+}
+
 /**
  * @brief Fetches a module from `pgtle.modules` using direct table/index scan
  * (safe even when SPI is not connected, such as inside QuickJS's module loader
  * callback during function compilation).
+ *
+ * Supports both the canonical `pg_tle` catalog schema (`module_name`,
+ * `version`, `source_code`, `bytecode`, `requires`, `is_trusted`) and the
+ * legacy/test `pgtle.modules` schema (`name`, `version`, `format`, `source`,
+ * `bytecode`) via `TupleDesc` column lookup (JS-3).
  */
-static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
+static bool pljs_fetch_tle_module(const char *specifier,
+                                  const char *importer_spec, char **version_out,
                                   char **format_out, char **source_out,
-                                  bytea **bytecode_out) {
+                                  bytea **bytecode_out, int *errcode_out,
+                                  char **errmsg_out) {
   char *req_name = NULL;
   char *req_version = NULL;
 
@@ -3826,21 +4142,58 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
   *format_out = NULL;
   *source_out = NULL;
   *bytecode_out = NULL;
+  if (errcode_out != NULL) {
+    *errcode_out = 0;
+  }
+  if (errmsg_out != NULL) {
+    *errmsg_out = NULL;
+  }
 
   pljs_parse_tle_specifier(specifier, &req_name, &req_version);
 
   Oid nspoid = get_namespace_oid("pgtle", true);
   if (!OidIsValid(nspoid)) {
+    pfree(req_name);
+    if (req_version) {
+      pfree(req_version);
+    }
     return false;
   }
 
   Oid relid = get_relname_relid("modules", nspoid);
   if (!OidIsValid(relid)) {
+    pfree(req_name);
+    if (req_version) {
+      pfree(req_version);
+    }
     return false;
   }
 
   Relation rel = table_open(relid, AccessShareLock);
   TupleDesc tupdesc = RelationGetDescr(rel);
+
+  int att_name = pljs_find_attnum(tupdesc, "module_name");
+  if (att_name == 0) {
+    att_name = pljs_find_attnum(tupdesc, "name");
+  }
+  int att_ver = pljs_find_attnum(tupdesc, "version");
+  int att_fmt = pljs_find_attnum(tupdesc, "format");
+  int att_src = pljs_find_attnum(tupdesc, "source_code");
+  if (att_src == 0) {
+    att_src = pljs_find_attnum(tupdesc, "source");
+  }
+  int att_bc = pljs_find_attnum(tupdesc, "bytecode");
+  int att_trusted = pljs_find_attnum(tupdesc, "is_trusted");
+  int att_requires = pljs_find_attnum(tupdesc, "requires");
+
+  if (att_name == 0 || att_ver == 0) {
+    table_close(rel, AccessShareLock);
+    pfree(req_name);
+    if (req_version) {
+      pfree(req_version);
+    }
+    return false;
+  }
 
   Snapshot snap = GetActiveSnapshot();
   bool pushed = false;
@@ -3862,10 +4215,12 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
   char *best_fmt = NULL;
   char *best_src = NULL;
   bytea *best_bc = NULL;
+  bool best_trusted = true;
 
   while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    CHECK_FOR_INTERRUPTS();
     bool isnull = false;
-    Datum d_name = slot_getattr(slot, 1, &isnull);
+    Datum d_name = slot_getattr(slot, att_name, &isnull);
     if (isnull) {
       continue;
     }
@@ -3876,7 +4231,7 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
     }
     pfree(c_name);
 
-    Datum d_ver = slot_getattr(slot, 2, &isnull);
+    Datum d_ver = slot_getattr(slot, att_ver, &isnull);
     if (isnull) {
       continue;
     }
@@ -3894,38 +4249,44 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
       }
     }
 
-    char *c_fmt = NULL;
     char *c_src = NULL;
-    bytea *c_bc = NULL;
-    bool is_pgtle_schema =
-        (tupdesc->natts >= 4 &&
-         strcmp(NameStr(TupleDescAttr(tupdesc, 2)->attname), "source_code") ==
-             0);
-
-    if (is_pgtle_schema) {
-      Datum d_src = slot_getattr(slot, 3, &isnull);
+    if (att_src > 0) {
+      Datum d_src = slot_getattr(slot, att_src, &isnull);
       c_src = isnull ? NULL : TextDatumGetCString(d_src);
+    }
 
-      Datum d_bc = slot_getattr(slot, 4, &isnull);
+    bytea *c_bc = NULL;
+    if (att_bc > 0) {
+      Datum d_bc = slot_getattr(slot, att_bc, &isnull);
       c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+    }
 
+    char *c_fmt = NULL;
+    if (att_fmt > 0) {
+      Datum d_fmt = slot_getattr(slot, att_fmt, &isnull);
+      if (!isnull) {
+        c_fmt = TextDatumGetCString(d_fmt);
+      }
+    }
+    if (c_fmt == NULL) {
       if (c_bc != NULL) {
         c_fmt = pstrdup("bytecode");
-      } else if (c_src != NULL && strstr(c_src, "exports.") != NULL &&
+      } else if (c_src != NULL &&
+                 (strstr(c_src, "exports.") != NULL ||
+                  strstr(c_src, "module.exports") != NULL) &&
                  strstr(c_src, "export ") == NULL) {
         c_fmt = pstrdup("cjs");
       } else {
         c_fmt = pstrdup("esm");
       }
-    } else {
-      Datum d_fmt = slot_getattr(slot, 3, &isnull);
-      c_fmt = isnull ? pstrdup("esm") : TextDatumGetCString(d_fmt);
+    }
 
-      Datum d_src = slot_getattr(slot, 4, &isnull);
-      c_src = isnull ? NULL : TextDatumGetCString(d_src);
-
-      Datum d_bc = slot_getattr(slot, 5, &isnull);
-      c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+    bool is_trusted = true;
+    if (att_trusted > 0) {
+      Datum d_tr = slot_getattr(slot, att_trusted, &isnull);
+      if (!isnull) {
+        is_trusted = DatumGetBool(d_tr);
+      }
     }
 
     if (best_ver) {
@@ -3945,6 +4306,7 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
     best_fmt = c_fmt;
     best_src = c_src;
     best_bc = c_bc;
+    best_trusted = is_trusted;
     found = true;
 
     if (req_version != NULL) {
@@ -3954,20 +4316,71 @@ static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
 
   ExecDropSingleTupleTableSlot(slot);
   table_endscan(scan);
+
+  if (!pljs_check_importer_requires(
+          rel, tupdesc, snap, att_name, att_ver, att_requires, importer_spec,
+          req_name, best_ver, errcode_out, errmsg_out)) {
+    found = false;
+  } else if (found && !best_trusted && !superuser()) {
+    if (errcode_out != NULL) {
+      *errcode_out = ERRCODE_INSUFFICIENT_PRIVILEGE;
+    }
+    if (errmsg_out != NULL) {
+      *errmsg_out = psprintf(
+          "permission denied for untrusted pg_tle module \"%s\"", req_name);
+    }
+    found = false;
+  }
+
   if (pushed) {
     PopActiveSnapshot();
   }
   table_close(rel, AccessShareLock);
+  pfree(req_name);
+  if (req_version) {
+    pfree(req_version);
+  }
 
   if (found) {
+    if (best_src != NULL) {
+      pljs_encoding_init();
+      char *utf8_src = pljs_server_to_utf8(best_src, strlen(best_src));
+      if (utf8_src != best_src) {
+        pfree(best_src);
+        best_src = utf8_src;
+      }
+    }
     *version_out = best_ver;
     *format_out = best_fmt;
     *source_out = best_src;
     *bytecode_out = best_bc;
+  } else {
+    if (best_ver) {
+      pfree(best_ver);
+    }
+    if (best_fmt) {
+      pfree(best_fmt);
+    }
+    if (best_src) {
+      pfree(best_src);
+    }
+    if (best_bc) {
+      pfree(best_bc);
+    }
   }
 
   return found;
 }
+
+typedef struct pljs_js_module_def_head {
+  int ref_count;
+  uint8_t gc_obj_type_and_mark;
+  uint8_t dummy1;
+  uint16_t dummy2;
+  void *gc_link_prev;
+  void *gc_link_next;
+  JSAtom module_name;
+} pljs_js_module_def_head;
 
 char *pljs_module_normalize(JSContext *ctx, const char *base_name,
                             const char *name, void *opaque) {
@@ -3980,9 +4393,88 @@ char *pljs_module_normalize(JSContext *ctx, const char *base_name,
     s += 6;
   }
 
+  char *resolved = NULL;
+  if (s[0] == '.' &&
+      (s[1] == '/' || (s[1] == '.' && (s[2] == '/' || s[2] == '\0')))) {
+    bool escaped_root = false;
+    resolved = pljs_resolve_relative_specifier(base_name, s, &escaped_root);
+    if (escaped_root || resolved == NULL) {
+      char *msg = psprintf(
+          "relative module specifier \"%s\" traverses above root", name);
+      pljs_throw_coded_error(ctx, ERRCODE_INVALID_PARAMETER_VALUE, msg);
+      pfree(msg);
+      return NULL;
+    }
+    s = resolved;
+  }
+
+  char *importer_spec = NULL;
+  if (base_name != NULL && base_name[0] != '\0' && base_name[0] != '<') {
+    const char *b = base_name;
+    const char *b_hash = strchr(b, '#');
+    size_t b_len = b_hash ? (size_t)(b_hash - b) : strlen(b);
+    importer_spec = pnstrdup(b, b_len);
+  }
+
+  char *version = NULL;
+  char *format = NULL;
+  char *source = NULL;
+  bytea *bytecode = NULL;
+  int errcode = 0;
+  char *errmsg = NULL;
+
+  bool ok = pljs_fetch_tle_module(s, importer_spec, &version, &format, &source,
+                                  &bytecode, &errcode, &errmsg);
+  if (importer_spec != NULL) {
+    pfree(importer_spec);
+  }
+  if (format != NULL) {
+    pfree(format);
+  }
+  if (source != NULL) {
+    pfree(source);
+  }
+  if (bytecode != NULL) {
+    pfree(bytecode);
+  }
+
+  if (!ok && errcode != 0 && errmsg != NULL) {
+    pljs_throw_coded_error(ctx, errcode, errmsg);
+    pfree(errmsg);
+    if (version != NULL) {
+      pfree(version);
+    }
+    if (resolved != NULL) {
+      pfree(resolved);
+    }
+    return NULL;
+  }
+  if (errmsg != NULL) {
+    pfree(errmsg);
+  }
+
   uint64 fp = pljs_tle_modules_fingerprint();
-  char buf[256];
-  snprintf(buf, sizeof(buf), "%s#fp=%lu", s, (unsigned long)fp);
+  char buf[512];
+  if (ok && version != NULL) {
+    char *req_name = NULL;
+    char *req_ver = NULL;
+    pljs_parse_tle_specifier(s, &req_name, &req_ver);
+    snprintf(buf, sizeof(buf), "%s@%s#fp=%lu", req_name, version,
+             (unsigned long)fp);
+    pfree(req_name);
+    if (req_ver != NULL) {
+      pfree(req_ver);
+    }
+    pfree(version);
+  } else {
+    if (version != NULL) {
+      pfree(version);
+    }
+    snprintf(buf, sizeof(buf), "%s#fp=%lu", s, (unsigned long)fp);
+  }
+  if (resolved != NULL) {
+    pfree(resolved);
+  }
   return js_strdup(ctx, buf);
 }
 
@@ -3992,42 +4484,68 @@ JSModuleDef *pljs_module_loader(JSContext *ctx, const char *module_name,
   char *format = NULL;
   char *source = NULL;
   bytea *bytecode = NULL;
+  int errcode = 0;
+  char *errmsg = NULL;
 
-  MemoryContext old_ctx = MemoryContextSwitchTo(TopTransactionContext);
-  bool ok =
-      pljs_fetch_tle_module(module_name, &version, &format, &source, &bytecode);
-  MemoryContextSwitchTo(old_ctx);
+  bool ok = pljs_fetch_tle_module(module_name, NULL, &version, &format, &source,
+                                  &bytecode, &errcode, &errmsg);
 
   if (!ok) {
-    JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'", module_name);
-    return NULL;
+    if (errcode != 0 && errmsg != NULL) {
+      pljs_throw_coded_error(ctx, errcode, errmsg);
+      pfree(errmsg);
+      return NULL;
+    }
+    Oid pljs_nsp = get_namespace_oid("pljs", true);
+    if (OidIsValid(pljs_nsp) &&
+        OidIsValid(get_relname_relid("modules", pljs_nsp)) &&
+        OidIsValid(get_relname_relid("pljs_modules_path", pljs_nsp))) {
+      const char *hash_sep = strchr(module_name, '#');
+      size_t clean_len =
+          hash_sep ? (size_t)(hash_sep - module_name) : strlen(module_name);
+      char *clean_name = pnstrdup(module_name, clean_len);
+      size_t buf_len = 0;
+      char *pljs_src = (char *)pljs_read_module(&buf_len, clean_name);
+      pfree(clean_name);
+      if (pljs_src != NULL) {
+        source = pljs_src;
+        format = pstrdup("esm");
+        ok = true;
+      }
+    }
+    if (!ok) {
+      JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'", module_name);
+      return NULL;
+    }
   }
 
   JSValue func_val = JS_UNDEFINED;
+  JSModuleDef *m = NULL;
 
   if (strcmp(format, "bytecode") == 0 && bytecode != NULL) {
     const uint8_t *buf = (const uint8_t *)VARDATA_ANY(bytecode);
     size_t buf_len = VARSIZE_ANY_EXHDR(bytecode);
     func_val = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
-    if (JS_IsException(func_val)) {
-      return NULL;
-    }
-    if (JS_VALUE_GET_TAG(func_val) == JS_TAG_MODULE) {
-      if (JS_ResolveModule(ctx, func_val) < 0) {
-        JS_FreeValue(ctx, func_val);
-        return NULL;
+    if (!JS_IsException(func_val)) {
+      if (JS_VALUE_GET_TAG(func_val) == JS_TAG_MODULE) {
+        pljs_js_module_def_head *mh =
+            (pljs_js_module_def_head *)JS_VALUE_GET_PTR(func_val);
+        JSAtom new_name = JS_NewAtom(ctx, module_name);
+        if (new_name != JS_ATOM_NULL) {
+          JS_FreeAtom(ctx, mh->module_name);
+          mh->module_name = new_name;
+        }
+        if (JS_ResolveModule(ctx, func_val) >= 0) {
+          m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+        }
+      } else {
+        JS_ThrowTypeError(
+            ctx, "pg_tle bytecode for '%s' is not a compiled module",
+            module_name);
       }
-      JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
       JS_FreeValue(ctx, func_val);
-      return m;
     }
-    JS_FreeValue(ctx, func_val);
-    JS_ThrowTypeError(ctx, "pg_tle bytecode for '%s' is not a compiled module",
-                      module_name);
-    return NULL;
-  }
-
-  if (strcmp(format, "cjs") == 0 && source != NULL) {
+  } else if (strcmp(format, "cjs") == 0 && source != NULL) {
     StringInfoData wrapped;
     initStringInfo(&wrapped);
     appendStringInfo(&wrapped,
@@ -4039,67 +4557,121 @@ JSModuleDef *pljs_module_loader(JSContext *ctx, const char *module_name,
     func_val = JS_Eval(ctx, wrapped.data, wrapped.len, module_name,
                        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     pfree(wrapped.data);
+    if (!JS_IsException(func_val)) {
+      m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+      JS_FreeValue(ctx, func_val);
+    }
   } else if (source != NULL) {
     func_val = JS_Eval(ctx, source, strlen(source), module_name,
                        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (!JS_IsException(func_val)) {
+      m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+      JS_FreeValue(ctx, func_val);
+    }
   } else {
     JS_ThrowTypeError(ctx, "pg_tle module '%s' has no source or bytecode",
                       module_name);
-    return NULL;
   }
 
-  if (JS_IsException(func_val)) {
-    return NULL;
+  if (version) {
+    pfree(version);
   }
-
-  JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
-  JS_FreeValue(ctx, func_val);
+  if (format) {
+    pfree(format);
+  }
+  if (source) {
+    pfree(source);
+  }
+  if (bytecode) {
+    pfree(bytecode);
+  }
   return m;
 }
 
 /**
  * @brief Synchronous `require(specifier)` / `pljs.require(specifier)` supporting
- * both CommonJS (`cjs`) and ES Modules (`esm`) stored in `pgtle.modules`.
+ * both CommonJS (`cjs`) and ES Modules (`esm`) stored in `pgtle.modules` or
+ * `pljs.modules`.
  */
 JSValue pljs_require(JSContext *ctx, JSValueConst this_val, int argc,
                      JSValueConst *argv) {
-  if (argc < 1) {
-    return js_throw("require() expects a module specifier string", ctx);
+  if (argc != 1) {
+    return js_throw("pljs.require() expects exactly one argument", ctx);
   }
 
-  const char *spec = JS_ToCString(ctx, argv[0]);
-  if (spec == NULL) {
+  if (!JS_IsString(argv[0])) {
+    return js_throw("pljs.require() expects a string", ctx);
+  }
+
+  const char *raw_spec = JS_ToCString(ctx, argv[0]);
+  if (raw_spec == NULL) {
     return JS_EXCEPTION;
+  }
+
+  char *resolved_spec = NULL;
+  const char *spec = raw_spec;
+  if (spec[0] == '.' &&
+      (spec[1] == '/' || (spec[1] == '.' && (spec[2] == '/' || spec[2] == '\0')))) {
+    bool escaped_root = false;
+    resolved_spec = pljs_resolve_relative_specifier(
+        pljs_current_cjs_module_name, spec, &escaped_root);
+    if (escaped_root || resolved_spec == NULL) {
+      char *msg = psprintf(
+          "relative module specifier \"%s\" traverses above root", raw_spec);
+      JSValue err =
+          pljs_throw_coded_error(ctx, ERRCODE_INVALID_PARAMETER_VALUE, msg);
+      pfree(msg);
+      JS_FreeCString(ctx, raw_spec);
+      return err;
+    }
+    spec = resolved_spec;
   }
 
   char *version = NULL;
   char *format = NULL;
   char *source = NULL;
   bytea *bytecode = NULL;
+  int errcode = 0;
+  char *errmsg = NULL;
 
-  MemoryContext old_ctx = MemoryContextSwitchTo(TopTransactionContext);
-  bool ok = pljs_fetch_tle_module(spec, &version, &format, &source, &bytecode);
-  MemoryContextSwitchTo(old_ctx);
+  bool ok = pljs_fetch_tle_module(spec, pljs_current_cjs_module_name, &version,
+                                  &format, &source, &bytecode, &errcode,
+                                  &errmsg);
 
   if (!ok) {
-    Oid pljs_nsp = get_namespace_oid("pljs", true);
-    if (OidIsValid(pljs_nsp) &&
-        OidIsValid(get_relname_relid("modules", pljs_nsp)) &&
-        OidIsValid(get_relname_relid("pljs_modules_path", pljs_nsp)) &&
-        strncmp(spec, "tle:", 4) != 0 && strncmp(spec, "pgtle:", 6) != 0) {
-      JSValue ret = pljs_module_require(ctx, spec);
-      JS_FreeCString(ctx, spec);
-      return ret;
+    JSValue err;
+    if (errcode != 0 && errmsg != NULL) {
+      err = pljs_throw_coded_error(ctx, errcode, errmsg);
+      pfree(errmsg);
+    } else {
+      Oid pljs_nsp = get_namespace_oid("pljs", true);
+      if (OidIsValid(pljs_nsp) &&
+          OidIsValid(get_relname_relid("modules", pljs_nsp)) &&
+          OidIsValid(get_relname_relid("pljs_modules_path", pljs_nsp)) &&
+          strncmp(spec, "tle:", 4) != 0 && strncmp(spec, "pgtle:", 6) != 0) {
+        JSValue ret = pljs_module_require(ctx, spec);
+        if (resolved_spec != NULL) {
+          pfree(resolved_spec);
+        }
+        JS_FreeCString(ctx, raw_spec);
+        return ret;
+      }
+      err = JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'", spec);
     }
-    JSValue err = JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'",
-                                         spec);
-    JS_FreeCString(ctx, spec);
+    if (resolved_spec != NULL) {
+      pfree(resolved_spec);
+    }
+    JS_FreeCString(ctx, raw_spec);
     return err;
   }
 
   JSValue result = JS_UNDEFINED;
 
   if (strcmp(format, "cjs") == 0 && source != NULL) {
+    const char *prev_cjs = pljs_current_cjs_module_name;
+    char *cur_cjs = version ? psprintf("%s@%s", spec, version) : pstrdup(spec);
+    pljs_current_cjs_module_name = cur_cjs;
+
     StringInfoData wrapped;
     initStringInfo(&wrapped);
     appendStringInfo(&wrapped,
@@ -4113,6 +4685,9 @@ JSValue pljs_require(JSContext *ctx, JSValueConst this_val, int argc,
                      source);
     result = JS_Eval(ctx, wrapped.data, wrapped.len, spec, JS_EVAL_TYPE_GLOBAL);
     pfree(wrapped.data);
+
+    pljs_current_cjs_module_name = prev_cjs;
+    pfree(cur_cjs);
   } else {
     /* Evaluate as an ES module and return its namespace exports object */
     StringInfoData import_code;
@@ -4139,7 +4714,22 @@ JSValue pljs_require(JSContext *ctx, JSValueConst this_val, int argc,
     }
   }
 
-  JS_FreeCString(ctx, spec);
+  if (version) {
+    pfree(version);
+  }
+  if (format) {
+    pfree(format);
+  }
+  if (source) {
+    pfree(source);
+  }
+  if (bytecode) {
+    pfree(bytecode);
+  }
+  if (resolved_spec != NULL) {
+    pfree(resolved_spec);
+  }
+  JS_FreeCString(ctx, raw_spec);
   return result;
 }
 

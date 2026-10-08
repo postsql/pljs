@@ -94,3 +94,183 @@ DROP FUNCTION test_cjs_require(text);
 DROP FUNCTION test_bytecode_import(int, int);
 DROP SCHEMA pgtle CASCADE;
 NOTICE:  drop cascades to table pgtle.modules
+-- 8. Test canonical pg_tle catalog schema (module_name, source_code, requires, is_trusted),
+--    relative imports (./ and ../), and JS-4 semicolon-in-string/comment import parsing
+CREATE SCHEMA pgtle;
+CREATE TABLE pgtle.modules (
+    module_name text NOT NULL,
+    version text NOT NULL,
+    source_code text NOT NULL,
+    bytecode bytea,
+    requires text[],
+    is_trusted boolean NOT NULL DEFAULT true,
+    PRIMARY KEY (module_name, version)
+);
+GRANT USAGE ON SCHEMA pgtle TO PUBLIC;
+GRANT SELECT ON pgtle.modules TO PUBLIC;
+INSERT INTO pgtle.modules (module_name, version, source_code, requires, is_trusted) VALUES
+  ('pkg/sub/leaf.js', '1.0.0', 'export function leafVal() { return 11; }', NULL, true),
+  ('pkg/helper.js', '1.0.0', 'import { leafVal } from "./sub/leaf.js"; export function doubleLeaf(x) { return x * 2 + leafVal(); }', ARRAY['pkg/sub/leaf.js'], true),
+  ('pkg/sub/back.js', '1.0.0', 'import { doubleLeaf } from "../helper.js"; export function fromSub(x) { return doubleLeaf(x) + 1; }', ARRAY['pkg/helper.js'], true),
+  ('pkg/blocked.js', '1.0.0', 'import { leafVal } from "./sub/leaf.js"; export function bad() { return leafVal(); }', ARRAY['other_mod'], true),
+  ('pkg/escape.js', '1.0.0', 'import { val } from "../../semi;mod"; export function esc() { return val(); }', NULL, true),
+  ('semi;mod', '1.0.0', 'export function val() { return 42; }', NULL, true),
+  ('admin_secret', '1.0.0', 'export function secret() { return "top-secret"; }', NULL, false);
+CREATE OR REPLACE FUNCTION test_rel_and_semi(x int) RETURNS int LANGUAGE pljs AS $$
+  /* comment with ; before import */
+  import {
+    "fromSub" as fromSub
+  } from 'tle:pkg/sub/back.js@1.0.0'
+  import { val } from "tle:semi;mod@1.0.0";
+  return fromSub(x) + val();
+$$;
+SELECT test_rel_and_semi(5);
+ test_rel_and_semi 
+-------------------
+                64
+(1 row)
+
+-- Relative specifier traversal above root rejection
+DO $$
+BEGIN
+  BEGIN
+    CREATE OR REPLACE FUNCTION test_escape_root() RETURNS int LANGUAGE pljs AS $fn$
+      import { esc } from 'tle:pkg/escape.js@1.0.0';
+      return esc();
+    $fn$;
+    PERFORM test_escape_root();
+    RAISE EXCEPTION 'Expected root traversal rejection';
+  EXCEPTION WHEN invalid_parameter_value THEN
+    RAISE NOTICE 'Caught expected root traversal rejection';
+  END;
+END;
+$$;
+NOTICE:  Caught expected root traversal rejection
+-- Requires allowlist enforcement
+DO $$
+BEGIN
+  BEGIN
+    CREATE OR REPLACE FUNCTION test_blocked_req() RETURNS int LANGUAGE pljs AS $fn$
+      import { bad } from 'tle:pkg/blocked.js@1.0.0';
+      return bad();
+    $fn$;
+    PERFORM test_blocked_req();
+    RAISE EXCEPTION 'Expected requires allowlist violation';
+  EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Caught expected requires violation';
+  END;
+END;
+$$;
+NOTICE:  Caught expected requires violation
+-- Untrusted module enforcement for unprivileged role
+CREATE OR REPLACE FUNCTION test_untrusted_tle() RETURNS text LANGUAGE pljs AS $$
+  import { secret } from 'tle:admin_secret@1.0.0';
+  return secret();
+$$;
+SELECT test_untrusted_tle();
+ test_untrusted_tle 
+--------------------
+ top-secret
+(1 row)
+
+CREATE ROLE pljs_unpriv_tle_user;
+GRANT EXECUTE ON FUNCTION test_untrusted_tle() TO pljs_unpriv_tle_user;
+SET ROLE pljs_unpriv_tle_user;
+DO $$
+BEGIN
+  BEGIN
+    PERFORM test_untrusted_tle();
+    RAISE EXCEPTION 'Expected untrusted module rejection for non-superuser';
+  EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Caught expected untrusted module rejection';
+  END;
+END;
+$$;
+NOTICE:  Caught expected untrusted module rejection
+RESET ROLE;
+-- 9. ES module singleton semantics across multiple importers + 1-arg bytecode requires + pljs_reset()
+INSERT INTO pgtle.modules (module_name, version, source_code, requires, is_trusted) VALUES
+  ('singleton_c', '1.0.0', 'let count = 0; const p = pljs; const g = globalThis; export function inc() { return ++count; }', NULL, true),
+  ('importer_a', '1.0.0', 'import { inc } from "tle:singleton_c"; export function a() { return inc(); }', ARRAY['singleton_c'], true),
+  ('importer_b', '1.0.0', 'import { inc } from "tle:singleton_c@1.0.0"; export function b() { return inc(); }', ARRAY['singleton_c'], true);
+CREATE OR REPLACE FUNCTION test_esm_singleton() RETURNS int[] LANGUAGE pljs AS $$
+  import { a } from 'tle:importer_a';
+  import { b } from 'tle:importer_b';
+  import { inc } from 'tle:singleton_c';
+  return [inc(), a(), b()];
+$$;
+SELECT test_esm_singleton();
+ test_esm_singleton 
+--------------------
+ {1,2,3}
+(1 row)
+
+SELECT test_esm_singleton();
+ test_esm_singleton 
+--------------------
+ {4,5,6}
+(1 row)
+
+-- 1-arg pljs.compile_bytecode module must also obey its requires allowlist
+DO LANGUAGE pljs $$
+  const bc = pljs.compile_bytecode('import { inc } from "tle:singleton_c"; export function bcu() { return inc(); }');
+  pljs.execute(
+    'INSERT INTO pgtle.modules (module_name, version, source_code, bytecode, requires, is_trusted) VALUES ($1, $2, $3, $4, $5, true)',
+    ['bc_restricted', '1.0.0', '', bc, ['other_mod']]
+  );
+$$;
+DO $$
+BEGIN
+  BEGIN
+    CREATE OR REPLACE FUNCTION test_bc_restricted() RETURNS int LANGUAGE pljs AS $fn$
+      import { bcu } from 'tle:bc_restricted';
+      return bcu();
+    $fn$;
+    PERFORM test_bc_restricted();
+    RAISE EXCEPTION 'Expected requires violation for 1-arg bytecode module';
+  EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Caught expected 1-arg bytecode requires violation';
+  END;
+END;
+$$;
+NOTICE:  Caught expected 1-arg bytecode requires violation
+-- pljs_reset() must cleanly tear down contexts with loaded ES modules referencing pljs/globalThis
+SELECT pljs_reset();
+ pljs_reset 
+------------
+ 
+(1 row)
+
+SELECT test_esm_singleton();
+ test_esm_singleton 
+--------------------
+ {1,2,3}
+(1 row)
+
+SELECT pljs_reset();
+ pljs_reset 
+------------
+ 
+(1 row)
+
+-- Static import fallback to pljs.modules when module is not in pgtle.modules
+INSERT INTO pljs.modules (path, source) VALUES
+  ('pljs_native_esm', 'export function nativeMul(x, y) { return x * y; }');
+CREATE OR REPLACE FUNCTION test_pljs_native_static_import(x int, y int) RETURNS int LANGUAGE pljs AS $$
+  import { nativeMul } from 'pljs_native_esm';
+  return nativeMul(x, y);
+$$;
+SELECT test_pljs_native_static_import(6, 7);
+ test_pljs_native_static_import 
+--------------------------------
+                             42
+(1 row)
+
+DELETE FROM pljs.modules WHERE path = 'pljs_native_esm';
+DROP FUNCTION test_pljs_native_static_import(int, int);
+DROP FUNCTION test_esm_singleton();
+DROP FUNCTION test_untrusted_tle();
+DROP FUNCTION test_rel_and_semi(int);
+DROP ROLE pljs_unpriv_tle_user;
+DROP SCHEMA pgtle CASCADE;
+NOTICE:  drop cascades to table pgtle.modules

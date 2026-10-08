@@ -434,6 +434,7 @@ ParamListInfo pljs_setup_variable_paramlist(pljs_param_state *, Datum *,
                                             char *);
 
 // modules.c
+uint8_t *pljs_read_module(size_t *pbuf_len, const char *filename);
 JSModuleDef *pljs_defaultjs_module_loader(JSContext *ctx,
                                           const char *module_name,
                                           void *opaque);

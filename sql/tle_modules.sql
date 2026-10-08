@@ -1,0 +1,84 @@
+-- Test pg_tle ES Module / CommonJS / QuickJS Bytecode loader in PL/JS
+CREATE SCHEMA IF NOT EXISTS pgtle;
+
+CREATE TABLE IF NOT EXISTS pgtle.modules (
+    name text NOT NULL,
+    version text NOT NULL,
+    format text NOT NULL,
+    source text,
+    bytecode bytea,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (name, version)
+);
+
+-- 1. Install ESM modules (v1.0.0 and v1.2.0) and a nested dependency
+INSERT INTO pgtle.modules (name, version, format, source) VALUES
+  ('math-core', '1.0.0', 'esm', 'export function square(x) { return x * x; }'),
+  ('math-utils', '1.0.0', 'esm', 'import { square } from "math-core@1.0.0"; export function sumSquares(a, b) { return square(a) + square(b); } export const VERSION = "1.0.0";'),
+  ('math-utils', '1.2.0', 'esm', 'import { square } from "math-core@1.0.0"; export function sumSquares(a, b) { return square(a) + square(b); } export function cube(x) { return x * x * x; } export const VERSION = "1.2.0";');
+
+-- 2. Install a CommonJS module
+INSERT INTO pgtle.modules (name, version, format, source) VALUES
+  ('string-helpers', '2.1.0', 'cjs', 'exports.shout = function(s) { return s.toUpperCase() + "!"; };');
+
+-- 3. Test static ES Module import with explicit version and latest version resolution
+CREATE OR REPLACE FUNCTION test_esm_pinned(a int, b int) RETURNS text LANGUAGE pljs AS $$
+  import { sumSquares, VERSION } from 'tle:math-utils@1.0.0';
+  return VERSION + ':' + sumSquares(a, b);
+$$;
+
+CREATE OR REPLACE FUNCTION test_esm_latest(a int, b int) RETURNS text LANGUAGE pljs AS $$
+  import { sumSquares, cube, VERSION } from 'math-utils';
+  return VERSION + ':' + sumSquares(a, b) + ':' + cube(a);
+$$;
+
+SELECT test_esm_pinned(3, 4);
+SELECT test_esm_latest(3, 4);
+
+-- 4. Test CommonJS require() / pljs.require()
+CREATE OR REPLACE FUNCTION test_cjs_require(msg text) RETURNS text LANGUAGE pljs AS $$
+  const helpers = require('string-helpers@2.1.0');
+  const math = pljs.require('math-utils@1.0.0');
+  return helpers.shout(msg) + ' (' + math.sumSquares(5, 12) + ')';
+$$;
+
+SELECT test_cjs_require('hello tle');
+
+-- 5. Test QuickJS precompiled bytecode module (pljs.compile_bytecode + format = 'bytecode')
+DO LANGUAGE pljs $$
+  const bc = pljs.compile_bytecode(
+    'export function fastAdd(x, y) { return x + y + 100; }',
+    'fast-mod@1.0.0'
+  );
+  pljs.execute(
+    'INSERT INTO pgtle.modules (name, version, format, bytecode) VALUES ($1, $2, $3, $4)',
+    ['fast-mod', '1.0.0', 'bytecode', bc]
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION test_bytecode_import(x int, y int) RETURNS int LANGUAGE pljs AS $$
+  import { fastAdd } from 'fast-mod@1.0.0';
+  return fastAdd(x, y);
+$$;
+
+SELECT test_bytecode_import(10, 20);
+
+-- 6. Test automatic invalidation when a module in pgtle.modules is updated
+UPDATE pgtle.modules
+SET source = 'export function sumSquares(a, b) { return (a + b) * 1000; } export const VERSION = "1.0.0-patched";'
+WHERE name = 'math-utils' AND version = '1.0.0';
+
+SELECT test_esm_pinned(3, 4);
+
+-- 7. Test DO block with static ES module import
+DO LANGUAGE pljs $$
+  import { VERSION } from 'math-utils@1.2.0';
+  pljs.elog(NOTICE, 'DO block imported math-utils version: ' + VERSION);
+$$;
+
+DROP FUNCTION test_esm_pinned(int, int);
+DROP FUNCTION test_esm_latest(int, int);
+DROP FUNCTION test_cjs_require(text);
+DROP FUNCTION test_bytecode_import(int, int);
+DROP SCHEMA pgtle CASCADE;

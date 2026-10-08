@@ -594,6 +594,16 @@ pljs_function_cache_value *pljs_cache_function_find(Oid user_id, Oid fn_oid,
     return NULL;
   }
 
+  /*
+   * If this function uses static ES module imports from pgtle.modules, verify
+   * that the pgtle.modules catalog fingerprint has not changed.
+   */
+  if (value->has_tle_imports &&
+      value->tle_modules_fingerprint != pljs_tle_modules_fingerprint()) {
+    pljs_cache_function_remove(fn_oid);
+    return NULL;
+  }
+
   return value;
 }
 
@@ -630,6 +640,9 @@ void pljs_function_cache_to_context(pljs_context *context,
   for (int i = 0; i < function_entry->nhandlers; i++) {
     context->function->handlers[i] = function_entry->handlers[i];
   }
+  context->function->has_tle_imports = function_entry->has_tle_imports;
+  context->function->tle_modules_fingerprint =
+      function_entry->tle_modules_fingerprint;
 
   context->js_function = function_entry->fn;
 
@@ -680,6 +693,9 @@ void pljs_context_to_function_cache(pljs_function_cache_value *function_entry,
   for (int i = 0; i < context->function->nhandlers; i++) {
     function_entry->handlers[i] = context->function->handlers[i];
   }
+  function_entry->has_tle_imports = context->function->has_tle_imports;
+  function_entry->tle_modules_fingerprint =
+      context->function->tle_modules_fingerprint;
 
   function_entry->fn = context->js_function;
   function_entry->nargs = context->function->inargs;

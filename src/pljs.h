@@ -110,6 +110,8 @@ typedef struct pljs_function_cache_value {
    */
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
+  bool has_tle_imports;
+  uint64 tle_modules_fingerprint;
 } pljs_function_cache_value;
 
 typedef struct pljs_param_state {
@@ -175,6 +177,8 @@ typedef struct pljs_func {
 
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
+  bool has_tle_imports;
+  uint64 tle_modules_fingerprint;
 
   bool trigger;
   bool is_srf;                  // are we a set returning function?
@@ -280,6 +284,19 @@ pljs_storage *pljs_current_storage(void);
 
 // Whether a function's result is being converted, anywhere up the stack
 extern bool pljs_converting_result;
+
+// pg_tle ES Module / CJS / QuickJS Bytecode loader
+char *pljs_module_normalize(JSContext *ctx, const char *base_name,
+                            const char *name, void *opaque);
+JSModuleDef *pljs_module_loader(JSContext *ctx, const char *module_name,
+                                void *opaque);
+JSValue pljs_require(JSContext *ctx, JSValueConst this_val, int argc,
+                     JSValueConst *argv);
+JSValue pljs_compile_bytecode_js(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv);
+bool pljs_extract_static_imports(const char *source, StringInfo imports_out,
+                                 StringInfo body_out);
+uint64 pljs_tle_modules_fingerprint(void);
 
 // cache.c
 

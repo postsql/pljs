@@ -1,6 +1,11 @@
 #include "postgres.h"
 
+#include <dlfcn.h>
+
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
@@ -16,6 +21,7 @@
 #include "utils/lsyscache.h"
 #include "utils/palloc.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "deps/quickjs/quickjs.h"
@@ -42,7 +48,7 @@ static Datum call_srf_function(PG_FUNCTION_ARGS, pljs_context *context,
 static Datum convert_result(FunctionCallInfo fcinfo, pljs_context *context,
                             Oid rettype, JSValue ret);
 
-static void pljs_build_function_source(StringInfoData *src,
+static bool pljs_build_function_source(StringInfoData *src,
                                        pljs_context *context, bool is_trigger);
 static void call_anonymous_function(const char *, JSContext *);
 static Datum call_trigger(FunctionCallInfo fcinfo, pljs_context *context);
@@ -152,6 +158,9 @@ void pljs_runtime_init(void) {
   // so every context sees the class; e.g. the prepared-statement handle whose
   // finalizer reclaims otherwise-leaked SPI plans).
   pljs_register_js_classes(rt);
+
+  // Register pg_tle ES Module / QuickJS Bytecode loader.
+  JS_SetModuleLoaderFunc(rt, pljs_module_normalize, pljs_module_loader, NULL);
 
   // Set up a memory limit if it exists.
   if (configuration.memory_limit) {
@@ -2128,7 +2137,31 @@ Datum pljs_call_validator(PG_FUNCTION_ARGS) {
     PG_END_TRY();
   }
 
-  pljs_build_function_source(&src, &context, is_trigger);
+  bool is_module = pljs_build_function_source(&src, &context, is_trigger);
+
+  /*
+   * When static `import` statements are present, validate as an ES module.
+   * Note that JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY also resolves
+   * imported modules via pljs_module_loader; if check_function_bodies is on
+   * before modules are installed, we still validate syntax by parsing the
+   * wrapped body without resolving external modules if module resolution fails.
+   */
+  if (is_module) {
+    StringInfoData imports_buf, body_buf, syn_src;
+    initStringInfo(&imports_buf);
+    initStringInfo(&body_buf);
+    initStringInfo(&syn_src);
+    pljs_extract_static_imports(context.function->prosrc, &imports_buf,
+                                &body_buf);
+    char *saved_prosrc = context.function->prosrc;
+    context.function->prosrc = body_buf.data;
+    pljs_build_function_source(&syn_src, &context, is_trigger);
+    context.function->prosrc = saved_prosrc;
+    pfree(src.data);
+    src = syn_src;
+    pfree(imports_buf.data);
+    pfree(body_buf.data);
+  }
 
   bool free_temp_ctx = false;
   if (lang_is_pljs) {
@@ -2211,13 +2244,24 @@ Datum pljs_call_validator(PG_FUNCTION_ARGS) {
  *
  * The returned StringInfo's data is palloc'd; the caller frees it.
  */
-static void pljs_build_function_source(StringInfoData *src,
+static bool pljs_build_function_source(StringInfoData *src,
                                        pljs_context *context, bool is_trigger) {
   int i;
+  StringInfoData imports_buf;
+  StringInfoData body_buf;
+  bool has_imports;
   char *proname = pljs_server_to_utf8(context->function->proname,
                                       strlen(context->function->proname));
 
   initStringInfo(src);
+  initStringInfo(&imports_buf);
+  initStringInfo(&body_buf);
+
+  has_imports = pljs_extract_static_imports(context->function->prosrc,
+                                            &imports_buf, &body_buf);
+  if (has_imports) {
+    appendStringInfoString(src, imports_buf.data);
+  }
 
   // generate the function as javascript with all of its arguments
   appendStringInfo(src, "function %s (", proname);
@@ -2259,12 +2303,20 @@ static void pljs_build_function_source(StringInfoData *src,
                           "TG_RELID, TG_TABLE_NAME, TG_TABLE_SCHEMA, TG_ARGV");
   }
 
-  appendStringInfo(src, ") {\n%s\n}\n %s;\n", context->function->prosrc,
-                   proname);
+  if (has_imports) {
+    appendStringInfo(src, ") {\n%s\n}\nglobalThis.__pljs_compiled_fn = %s;\n",
+                     body_buf.data, proname);
+  } else {
+    appendStringInfo(src, ") {\n%s\n}\n %s;\n", context->function->prosrc,
+                     proname);
+  }
 
   if (proname != context->function->proname) {
     pfree(proname);
   }
+  pfree(imports_buf.data);
+  pfree(body_buf.data);
+  return has_imports;
 }
 
 /**
@@ -2286,6 +2338,7 @@ static void pljs_build_function_source(StringInfoData *src,
 typedef struct pljs_compile_run {
   pljs_context *context;
   StringInfoData src;
+  bool is_module;
   JSValue val;
 } pljs_compile_run;
 
@@ -2298,14 +2351,35 @@ typedef struct pljs_compile_run {
 static void compile_run(void *arg) {
   pljs_compile_run *run = (pljs_compile_run *)arg;
   JSContext *ctx = run->context->ctx;
-  JSValue val =
-      JS_Eval(ctx, run->src.data, strlen(run->src.data), "<function>", 0);
+  JSValue val;
+
+  if (run->is_module) {
+    char mod_filename[128];
+    snprintf(mod_filename, sizeof(mod_filename), "<function_%u_%lu>",
+             run->context->function->fn_oid,
+             (unsigned long)run->context->function->tle_modules_fingerprint);
+    JSValue mval = JS_Eval(ctx, run->src.data, strlen(run->src.data),
+                           mod_filename, JS_EVAL_TYPE_MODULE);
+    if (JS_IsException(mval)) {
+      val = mval;
+    } else {
+      JS_FreeValue(ctx, mval);
+      JSValue global_obj = JS_GetGlobalObject(ctx);
+      val = JS_GetPropertyStr(ctx, global_obj, "__pljs_compiled_fn");
+      JS_SetPropertyStr(ctx, global_obj, "__pljs_compiled_fn", JS_UNDEFINED);
+      JS_FreeValue(ctx, global_obj);
+    }
+  } else {
+    val = JS_Eval(ctx, run->src.data, strlen(run->src.data), "<function>", 0);
+  }
 
   pfree(run->src.data);
 
   if (JS_IsException(val)) {
     char *message = NULL, *pg_detail = NULL, *sqlstate = NULL;
     char *detail = dump_error(ctx, &message, &pg_detail, &sqlstate);
+
+    JS_FreeValue(ctx, val);
 
     /* Surface a pending cancel/terminate as the real PostgreSQL error. */
     CHECK_FOR_INTERRUPTS();
@@ -2330,7 +2404,12 @@ JSValue pljs_compile_function(pljs_context *context, bool is_trigger) {
     elog(ERROR, "failed to transpile function source code");
   }
 
-  pljs_build_function_source(&run.src, context, is_trigger);
+  run.is_module = pljs_build_function_source(&run.src, context, is_trigger);
+  context->function->has_tle_imports = run.is_module;
+  if (run.is_module) {
+    context->function->tle_modules_fingerprint = pljs_tle_modules_fingerprint();
+  }
+
   pljs_run_with_storage(NULL, NULL, true, compile_run, &run);
 
   return run.val;
@@ -2347,11 +2426,25 @@ JSValue pljs_compile_function(pljs_context *context, bool is_trigger) {
  */
 static void call_anonymous_function(const char *source, JSContext *ctx) {
   StringInfoData src;
+  StringInfoData imports_buf;
+  StringInfoData body_buf;
+  bool has_imports;
+  static uint64 do_counter = 0;
 
   initStringInfo(&src);
+  initStringInfo(&imports_buf);
+  initStringInfo(&body_buf);
 
-  // generate the function as javascript with all of its arguments
-  appendStringInfo(&src, "(function () {%s})();", source);
+  has_imports = pljs_extract_static_imports(source, &imports_buf, &body_buf);
+  if (has_imports) {
+    appendStringInfo(&src, "%s(function () {%s})();", imports_buf.data,
+                     body_buf.data);
+  } else {
+    // generate the function as javascript with all of its arguments
+    appendStringInfo(&src, "(function () {%s})();", source);
+  }
+  pfree(imports_buf.data);
+  pfree(body_buf.data);
 
   /*
    * Re-anchor QuickJS's stack measurement here, at the C-stack depth this call
@@ -2364,7 +2457,10 @@ static void call_anonymous_function(const char *source, JSContext *ctx) {
    */
   JS_UpdateStackTop(JS_GetRuntime(ctx));
 
-  JSValue val = JS_Eval(ctx, src.data, strlen(src.data), "<function>", 0);
+  char do_name[64];
+  snprintf(do_name, sizeof(do_name), "<do_%lu>", (unsigned long)(++do_counter));
+  JSValue val = JS_Eval(ctx, src.data, strlen(src.data), do_name,
+                        has_imports ? JS_EVAL_TYPE_MODULE : 0);
 
   if (!JS_IsException(val)) {
     JS_FreeValue(ctx, val);
@@ -3516,4 +3612,557 @@ JSValue pljs_find_js_function(Oid fn_oid, JSContext *ctx) {
   }
 
   return func;
+}
+
+/* =========================================================================
+ * pg_tle ES Module / CommonJS / QuickJS Bytecode Loader
+ * ========================================================================= */
+
+static int pljs_compare_semver(const char *a, const char *b) {
+  const char *pa = a ? a : "";
+  const char *pb = b ? b : "";
+
+  while (*pa || *pb) {
+    if (isdigit((unsigned char)*pa) && isdigit((unsigned char)*pb)) {
+      char *ea = NULL;
+      char *eb = NULL;
+      long va = strtol(pa, &ea, 10);
+      long vb = strtol(pb, &eb, 10);
+      if (va != vb) {
+        return (va > vb) ? 1 : -1;
+      }
+      pa = ea;
+      pb = eb;
+    } else {
+      if (*pa != *pb) {
+        return ((unsigned char)*pa > (unsigned char)*pb) ? 1 : -1;
+      }
+      if (*pa) {
+        pa++;
+      }
+      if (*pb) {
+        pb++;
+      }
+    }
+    if (*pa == '.') {
+      pa++;
+    }
+    if (*pb == '.') {
+      pb++;
+    }
+  }
+  return 0;
+}
+
+uint64 pljs_tle_modules_fingerprint(void) {
+  Oid nspoid = get_namespace_oid("pgtle", true);
+  if (!OidIsValid(nspoid)) {
+    return 0;
+  }
+
+  Oid relid = get_relname_relid("modules", nspoid);
+  if (!OidIsValid(relid)) {
+    return 0;
+  }
+
+  uint64 hash = 1469598103934665603ULL;
+  Relation rel = table_open(relid, AccessShareLock);
+  Snapshot snap = GetActiveSnapshot();
+  bool pushed = false;
+  if (snap == NULL) {
+    PushActiveSnapshot(GetTransactionSnapshot());
+    snap = GetActiveSnapshot();
+    pushed = true;
+  }
+
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL);
+  TupleTableSlot *slot = table_slot_create(rel, NULL);
+
+  while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    bool should_free = false;
+    HeapTuple tup = ExecFetchSlotHeapTuple(slot, false, &should_free);
+    TransactionId xmin = HeapTupleHeaderGetRawXmin(tup->t_data);
+    BlockNumber blk = ItemPointerGetBlockNumber(&tup->t_self);
+    OffsetNumber off = ItemPointerGetOffsetNumber(&tup->t_self);
+
+    hash ^= (uint64)xmin;
+    hash *= 1099511628211ULL;
+    hash ^= ((uint64)blk << 16) | (uint64)off;
+    hash *= 1099511628211ULL;
+
+    if (should_free) {
+      heap_freetuple(tup);
+    }
+  }
+
+  ExecDropSingleTupleTableSlot(slot);
+  table_endscan(scan);
+  if (pushed) {
+    PopActiveSnapshot();
+  }
+  table_close(rel, AccessShareLock);
+  return hash;
+}
+
+/**
+ * @brief Extracts top-level ES module `import ...` statements from a function
+ * body so they can be hoisted above the generated `function proname(...)`
+ * wrapper when evaluating with `JS_EVAL_TYPE_MODULE`.
+ */
+bool pljs_extract_static_imports(const char *source, StringInfo imports_out,
+                                 StringInfo body_out) {
+  if (source == NULL) {
+    return false;
+  }
+
+  bool found_any = false;
+  const char *p = source;
+
+  while (*p != '\0') {
+    const char *line_start = p;
+    while (*p == ' ' || *p == '\t' || *p == '\r') {
+      p++;
+    }
+
+    if (strncmp(p, "import", 6) == 0 &&
+        (p[6] == ' ' || p[6] == '\t' || p[6] == '{' || p[6] == '*' ||
+         p[6] == '"' || p[6] == '\'')) {
+      const char *stmt_start = p;
+      char quote = 0;
+      while (*p != '\0') {
+        if (quote != 0) {
+          if (*p == '\\' && p[1] != '\0') {
+            p += 2;
+            continue;
+          }
+          if (*p == quote) {
+            quote = 0;
+          }
+          p++;
+        } else {
+          if (*p == '\'' || *p == '"') {
+            quote = *p++;
+          } else if (*p == ';') {
+            p++;
+            break;
+          } else if (*p == '\n') {
+            /* Check if we already saw 'from' or string literal */
+            break;
+          } else {
+            p++;
+          }
+        }
+      }
+      appendBinaryStringInfo(imports_out, stmt_start, p - stmt_start);
+      appendStringInfoChar(imports_out, '\n');
+      if (*p == '\n') {
+        p++;
+      }
+      found_any = true;
+    } else {
+      p = line_start;
+      const char *eol = strchr(p, '\n');
+      if (eol) {
+        appendBinaryStringInfo(body_out, p, (eol - p) + 1);
+        p = eol + 1;
+      } else {
+        appendStringInfoString(body_out, p);
+        break;
+      }
+    }
+  }
+
+  return found_any;
+}
+
+/**
+ * @brief Parses a specifier such as `"tle:lodash@4.17.21"`, `"@scope/pkg@1.0"`,
+ * or `"math-utils"` into `(mod_name, mod_version)`.
+ */
+static void pljs_parse_tle_specifier(const char *specifier, char **name_out,
+                                     char **version_out) {
+  const char *s = specifier;
+  if (strncmp(s, "tle://", 6) == 0) {
+    s += 6;
+  } else if (strncmp(s, "tle:", 4) == 0) {
+    s += 4;
+  } else if (strncmp(s, "pgtle:", 6) == 0) {
+    s += 6;
+  }
+
+  /* Strip internal cache-busting suffix `#fp=...` if present */
+  const char *hash_sep = strchr(s, '#');
+  size_t len = hash_sep ? (size_t)(hash_sep - s) : strlen(s);
+  char *clean = pnstrdup(s, len);
+
+  const char *at = strrchr(clean, '@');
+  if (at != NULL && at > clean) {
+    *name_out = pnstrdup(clean, at - clean);
+    *version_out = pstrdup(at + 1);
+  } else {
+    *name_out = pstrdup(clean);
+    *version_out = NULL;
+  }
+  pfree(clean);
+}
+
+/**
+ * @brief Fetches a module from `pgtle.modules` using direct table/index scan
+ * (safe even when SPI is not connected, such as inside QuickJS's module loader
+ * callback during function compilation).
+ */
+static bool pljs_fetch_tle_module(const char *specifier, char **version_out,
+                                  char **format_out, char **source_out,
+                                  bytea **bytecode_out) {
+  char *req_name = NULL;
+  char *req_version = NULL;
+
+  *version_out = NULL;
+  *format_out = NULL;
+  *source_out = NULL;
+  *bytecode_out = NULL;
+
+  pljs_parse_tle_specifier(specifier, &req_name, &req_version);
+
+  Oid nspoid = get_namespace_oid("pgtle", true);
+  if (!OidIsValid(nspoid)) {
+    return false;
+  }
+
+  Oid relid = get_relname_relid("modules", nspoid);
+  if (!OidIsValid(relid)) {
+    return false;
+  }
+
+  Relation rel = table_open(relid, AccessShareLock);
+  TupleDesc tupdesc = RelationGetDescr(rel);
+
+  Snapshot snap = GetActiveSnapshot();
+  bool pushed = false;
+  if (snap == NULL) {
+    PushActiveSnapshot(GetTransactionSnapshot());
+    snap = GetActiveSnapshot();
+    pushed = true;
+  }
+
+  TableScanDesc scan = table_beginscan(rel, snap, 0, NULL);
+  TupleTableSlot *slot = table_slot_create(rel, NULL);
+
+  bool found = false;
+  char *best_ver = NULL;
+  char *best_fmt = NULL;
+  char *best_src = NULL;
+  bytea *best_bc = NULL;
+
+  while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    bool isnull = false;
+    Datum d_name = slot_getattr(slot, 1, &isnull);
+    if (isnull) {
+      continue;
+    }
+    char *c_name = TextDatumGetCString(d_name);
+    if (strcmp(c_name, req_name) != 0) {
+      pfree(c_name);
+      continue;
+    }
+    pfree(c_name);
+
+    Datum d_ver = slot_getattr(slot, 2, &isnull);
+    if (isnull) {
+      continue;
+    }
+    char *c_ver = TextDatumGetCString(d_ver);
+
+    if (req_version != NULL) {
+      if (strcmp(c_ver, req_version) != 0) {
+        pfree(c_ver);
+        continue;
+      }
+    } else if (best_ver != NULL) {
+      if (pljs_compare_semver(c_ver, best_ver) <= 0) {
+        pfree(c_ver);
+        continue;
+      }
+    }
+
+    Datum d_fmt = slot_getattr(slot, 3, &isnull);
+    char *c_fmt = isnull ? pstrdup("esm") : TextDatumGetCString(d_fmt);
+
+    Datum d_src = slot_getattr(slot, 4, &isnull);
+    char *c_src = isnull ? NULL : TextDatumGetCString(d_src);
+
+    Datum d_bc = slot_getattr(slot, 5, &isnull);
+    bytea *c_bc = isnull ? NULL : DatumGetByteaPCopy(d_bc);
+
+    if (best_ver) {
+      pfree(best_ver);
+    }
+    if (best_fmt) {
+      pfree(best_fmt);
+    }
+    if (best_src) {
+      pfree(best_src);
+    }
+    if (best_bc) {
+      pfree(best_bc);
+    }
+
+    best_ver = c_ver;
+    best_fmt = c_fmt;
+    best_src = c_src;
+    best_bc = c_bc;
+    found = true;
+
+    if (req_version != NULL) {
+      break;
+    }
+  }
+
+  ExecDropSingleTupleTableSlot(slot);
+  table_endscan(scan);
+  if (pushed) {
+    PopActiveSnapshot();
+  }
+  table_close(rel, AccessShareLock);
+
+  if (found) {
+    *version_out = best_ver;
+    *format_out = best_fmt;
+    *source_out = best_src;
+    *bytecode_out = best_bc;
+  }
+
+  return found;
+}
+
+char *pljs_module_normalize(JSContext *ctx, const char *base_name,
+                            const char *name, void *opaque) {
+  const char *s = name;
+  if (strncmp(s, "tle://", 6) == 0) {
+    s += 6;
+  } else if (strncmp(s, "tle:", 4) == 0) {
+    s += 4;
+  } else if (strncmp(s, "pgtle:", 6) == 0) {
+    s += 6;
+  }
+
+  uint64 fp = pljs_tle_modules_fingerprint();
+  char buf[256];
+  snprintf(buf, sizeof(buf), "%s#fp=%lu", s, (unsigned long)fp);
+  return js_strdup(ctx, buf);
+}
+
+JSModuleDef *pljs_module_loader(JSContext *ctx, const char *module_name,
+                                void *opaque) {
+  char *version = NULL;
+  char *format = NULL;
+  char *source = NULL;
+  bytea *bytecode = NULL;
+
+  MemoryContext old_ctx = MemoryContextSwitchTo(TopTransactionContext);
+  bool ok =
+      pljs_fetch_tle_module(module_name, &version, &format, &source, &bytecode);
+  MemoryContextSwitchTo(old_ctx);
+
+  if (!ok) {
+    JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'", module_name);
+    return NULL;
+  }
+
+  JSValue func_val = JS_UNDEFINED;
+
+  if (strcmp(format, "bytecode") == 0 && bytecode != NULL) {
+    const uint8_t *buf = (const uint8_t *)VARDATA_ANY(bytecode);
+    size_t buf_len = VARSIZE_ANY_EXHDR(bytecode);
+    func_val = JS_ReadObject(ctx, buf, buf_len, JS_READ_OBJ_BYTECODE);
+    if (JS_IsException(func_val)) {
+      return NULL;
+    }
+    if (JS_VALUE_GET_TAG(func_val) == JS_TAG_MODULE) {
+      if (JS_ResolveModule(ctx, func_val) < 0) {
+        JS_FreeValue(ctx, func_val);
+        return NULL;
+      }
+      JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+      JS_FreeValue(ctx, func_val);
+      return m;
+    }
+    JS_FreeValue(ctx, func_val);
+    JS_ThrowTypeError(ctx, "pg_tle bytecode for '%s' is not a compiled module",
+                      module_name);
+    return NULL;
+  }
+
+  if (strcmp(format, "cjs") == 0 && source != NULL) {
+    StringInfoData wrapped;
+    initStringInfo(&wrapped);
+    appendStringInfo(&wrapped,
+                     "const module = { exports: {} };\n"
+                     "const exports = module.exports;\n"
+                     "(function(exports, module) {\n%s\n})(exports, module);\n"
+                     "export default module.exports;\n",
+                     source);
+    func_val = JS_Eval(ctx, wrapped.data, wrapped.len, module_name,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    pfree(wrapped.data);
+  } else if (source != NULL) {
+    func_val = JS_Eval(ctx, source, strlen(source), module_name,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  } else {
+    JS_ThrowTypeError(ctx, "pg_tle module '%s' has no source or bytecode",
+                      module_name);
+    return NULL;
+  }
+
+  if (JS_IsException(func_val)) {
+    return NULL;
+  }
+
+  JSModuleDef *m = (JSModuleDef *)JS_VALUE_GET_PTR(func_val);
+  JS_FreeValue(ctx, func_val);
+  return m;
+}
+
+/**
+ * @brief Synchronous `require(specifier)` / `pljs.require(specifier)` supporting
+ * both CommonJS (`cjs`) and ES Modules (`esm`) stored in `pgtle.modules`.
+ */
+JSValue pljs_require(JSContext *ctx, JSValueConst this_val, int argc,
+                     JSValueConst *argv) {
+  if (argc < 1) {
+    return js_throw("require() expects a module specifier string", ctx);
+  }
+
+  const char *spec = JS_ToCString(ctx, argv[0]);
+  if (spec == NULL) {
+    return JS_EXCEPTION;
+  }
+
+  char *version = NULL;
+  char *format = NULL;
+  char *source = NULL;
+  bytea *bytecode = NULL;
+
+  MemoryContext old_ctx = MemoryContextSwitchTo(TopTransactionContext);
+  bool ok = pljs_fetch_tle_module(spec, &version, &format, &source, &bytecode);
+  MemoryContextSwitchTo(old_ctx);
+
+  if (!ok) {
+    Oid pljs_nsp = get_namespace_oid("pljs", true);
+    if (OidIsValid(pljs_nsp) &&
+        OidIsValid(get_relname_relid("modules", pljs_nsp)) &&
+        OidIsValid(get_relname_relid("pljs_modules_path", pljs_nsp)) &&
+        strncmp(spec, "tle:", 4) != 0 && strncmp(spec, "pgtle:", 6) != 0) {
+      JSValue ret = pljs_module_require(ctx, spec);
+      JS_FreeCString(ctx, spec);
+      return ret;
+    }
+    JSValue err = JS_ThrowReferenceError(ctx, "pg_tle module not found: '%s'",
+                                         spec);
+    JS_FreeCString(ctx, spec);
+    return err;
+  }
+
+  JSValue result = JS_UNDEFINED;
+
+  if (strcmp(format, "cjs") == 0 && source != NULL) {
+    StringInfoData wrapped;
+    initStringInfo(&wrapped);
+    appendStringInfo(&wrapped,
+                     "(function() {\n"
+                     "  const module = { exports: {} };\n"
+                     "  const exports = module.exports;\n"
+                     "  (function(exports, require, module) {\n%s\n"
+                     "  })(exports, pljs.require, module);\n"
+                     "  return module.exports;\n"
+                     "})()",
+                     source);
+    result = JS_Eval(ctx, wrapped.data, wrapped.len, spec, JS_EVAL_TYPE_GLOBAL);
+    pfree(wrapped.data);
+  } else {
+    /* Evaluate as an ES module and return its namespace exports object */
+    StringInfoData import_code;
+    initStringInfo(&import_code);
+    appendStringInfo(&import_code,
+                     "import * as __ns from '%s';\n"
+                     "globalThis.__pljs_req_ns = __ns;\n",
+                     spec);
+    char req_name[128];
+    static uint64 req_seq = 0;
+    snprintf(req_name, sizeof(req_name), "<require_%lu>",
+             (unsigned long)(++req_seq));
+    JSValue mval = JS_Eval(ctx, import_code.data, import_code.len, req_name,
+                           JS_EVAL_TYPE_MODULE);
+    pfree(import_code.data);
+    if (JS_IsException(mval)) {
+      result = mval;
+    } else {
+      JS_FreeValue(ctx, mval);
+      JSValue global_obj = JS_GetGlobalObject(ctx);
+      result = JS_GetPropertyStr(ctx, global_obj, "__pljs_req_ns");
+      JS_SetPropertyStr(ctx, global_obj, "__pljs_req_ns", JS_UNDEFINED);
+      JS_FreeValue(ctx, global_obj);
+    }
+  }
+
+  JS_FreeCString(ctx, spec);
+  return result;
+}
+
+/**
+ * @brief `pljs.compile_bytecode(source, module_name)` compiles an ES module
+ * source string into QuickJS serialized bytecode (`Uint8Array` / `bytea`) that
+ * can be stored in `pgtle.modules` with `format = 'bytecode'`.
+ */
+JSValue pljs_compile_bytecode_js(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+  if (argc < 1) {
+    return js_throw("pljs.compile_bytecode(source[, module_name]) requires source",
+                    ctx);
+  }
+
+  const char *src = JS_ToCString(ctx, argv[0]);
+  if (!src) {
+    return JS_EXCEPTION;
+  }
+
+  const char *mod_name = "<bytecode_module>";
+  if (argc >= 2 && JS_IsString(argv[1])) {
+    mod_name = JS_ToCString(ctx, argv[1]);
+  }
+
+  JSValue obj = JS_Eval(ctx, src, strlen(src), mod_name,
+                        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (argc >= 2 && JS_IsString(argv[1])) {
+    JS_FreeCString(ctx, mod_name);
+  }
+  JS_FreeCString(ctx, src);
+
+  if (JS_IsException(obj)) {
+    return obj;
+  }
+
+  size_t out_len = 0;
+  uint8_t *out_buf =
+      JS_WriteObject(ctx, &out_len, obj, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(ctx, obj);
+
+  if (!out_buf) {
+    return JS_EXCEPTION;
+  }
+
+  JSValue ab = JS_NewArrayBufferCopy(ctx, out_buf, out_len);
+  js_free(ctx, out_buf);
+  if (JS_IsException(ab)) {
+    return ab;
+  }
+
+  JSValue global_obj = JS_GetGlobalObject(ctx);
+  JSValue u8_ctor = JS_GetPropertyStr(ctx, global_obj, "Uint8Array");
+  JSValue args[1] = {ab};
+  JSValue u8 = JS_CallConstructor(ctx, u8_ctor, 1, args);
+  JS_FreeValue(ctx, ab);
+  JS_FreeValue(ctx, u8_ctor);
+  JS_FreeValue(ctx, global_obj);
+  return u8;
 }

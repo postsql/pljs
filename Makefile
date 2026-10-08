@@ -120,7 +120,8 @@ REGRESS = init-extension function json jsonb json_conv types bytea context \
 	pg_resource_cleanup \
 	pg_parallel_mode \
 	hooks \
-	language_handler
+	language_handler \
+	tle_modules
 
 all: deps/quickjs/quickjs.h deps/quickjs/libquickjs.a pljs--$(PLJS_VERSION).sql
 

@@ -119,6 +119,12 @@ static const char *pljs_fdw_bootstrap_code =
     "    delete(rowid) {\n"
     "      throw new Error(this.constructor.name + ': delete() is not implemented');\n"
     "    }\n"
+    "    canDirectModify(operation, quals) {\n"
+    "      return false;\n"
+    "    }\n"
+    "    directModify(operation, quals, updates) {\n"
+    "      throw new Error(this.constructor.name + ': directModify() is not implemented');\n"
+    "    }\n"
     "    commit() {}\n"
     "    rollback() {}\n"
     "    static matchFilter(row, f) {\n"
@@ -355,6 +361,34 @@ static const char *pljs_fdw_bootstrap_code =
     "      this.map.delete(k);\n"
     "      return existing;\n"
     "    }\n"
+    "    canDirectModify(operation, quals) {\n"
+    "      return operation === 'DELETE' || operation === 'UPDATE';\n"
+    "    }\n"
+    "    directModify(operation, quals, updates) {\n"
+    "      this._ensureBackup();\n"
+    "      let affected = 0;\n"
+    "      const toDelete = [];\n"
+    "      const toUpdate = [];\n"
+    "      for (const [k, row] of this.map.entries()) {\n"
+    "        if (ForeignDataWrapper.matchFilters(row, quals)) {\n"
+    "          if (operation === 'DELETE') {\n"
+    "            toDelete.push(k);\n"
+    "          } else if (operation === 'UPDATE') {\n"
+    "            toUpdate.push([k, Object.assign({}, row, updates || {})]);\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "      for (let i = 0; i < toDelete.length; i++) {\n"
+    "        this.map.delete(toDelete[i]);\n"
+    "        affected++;\n"
+    "      }\n"
+    "      for (let i = 0; i < toUpdate.length; i++) {\n"
+    "        const [k, updated] = toUpdate[i];\n"
+    "        this.map.set(k, updated);\n"
+    "        affected++;\n"
+    "      }\n"
+    "      return affected;\n"
+    "    }\n"
     "    commit() {\n"
     "      this._txBackup = null;\n"
     "    }\n"
@@ -476,6 +510,23 @@ void pljs_fdw_context_reset(JSContext *ctx) {
   while (*pp != NULL) {
     PljsFdwCachedWrapper *curr = *pp;
     if (ctx == NULL || curr->ctx == ctx) {
+      *pp = curr->next;
+      if (curr->ctx != NULL && !JS_IsUndefined(curr->instance)) {
+        JS_FreeValue(curr->ctx, curr->instance);
+      }
+      pfree(curr);
+    } else {
+      pp = &curr->next;
+    }
+  }
+}
+
+void pljs_fdw_relcache_cb(Datum arg, Oid relid) {
+  (void)arg;
+  PljsFdwCachedWrapper **pp = &pljs_fdw_wrapper_head;
+  while (*pp != NULL) {
+    PljsFdwCachedWrapper *curr = *pp;
+    if (relid == InvalidOid || curr->foreigntableid == relid) {
       *pp = curr->next;
       if (curr->ctx != NULL && !JS_IsUndefined(curr->instance)) {
         JS_FreeValue(curr->ctx, curr->instance);
@@ -752,6 +803,21 @@ typedef struct PljsFdwModifyState {
   FmgrInfo type_io_flinfo;
 } PljsFdwModifyState;
 
+typedef struct PljsFdwDirectModifyState {
+  Oid user_id;
+  JSContext *ctx;
+  JSValue wrapper_instance;
+  CmdType operation;
+  int quals_count;
+  PljsQual *quals;
+  bool has_executed;
+  int64 affected_rows;
+  bool set_processed;
+  MemoryContext direct_mcxt;
+  MemoryContextCallback cleanup_cb;
+  FmgrInfo type_io_flinfo;
+} PljsFdwDirectModifyState;
+
 static bool pljs_fdw_ctx_is_alive(Oid user_id, JSContext *ctx) {
   if (ctx == NULL || !OidIsValid(user_id))
     return false;
@@ -783,6 +849,18 @@ static void pljs_fdw_modify_cleanup_cb(void *arg) {
     if (!JS_IsUndefined(fmstate->wrapper_instance)) {
       JS_FreeValue(fmstate->ctx, fmstate->wrapper_instance);
       fmstate->wrapper_instance = JS_UNDEFINED;
+    }
+  }
+}
+
+static void pljs_fdw_direct_modify_cleanup_cb(void *arg) {
+  PljsFdwDirectModifyState *dmstate = (PljsFdwDirectModifyState *)arg;
+  if (!dmstate)
+    return;
+  if (pljs_fdw_ctx_is_alive(dmstate->user_id, dmstate->ctx)) {
+    if (!JS_IsUndefined(dmstate->wrapper_instance)) {
+      JS_FreeValue(dmstate->ctx, dmstate->wrapper_instance);
+      dmstate->wrapper_instance = JS_UNDEFINED;
     }
   }
 }
@@ -2063,6 +2141,27 @@ static PljsCacheEntry *pljs_fdw_lru_find(PljsFdwScanState *festate,
 static PljsCacheEntry *pljs_fdw_lru_insert(PljsFdwScanState *festate,
                                            const char *key,
                                            Tuplestorestate *store) {
+  while ((festate->cache_entry_count >= festate->cache_max_entries ||
+          festate->cache_current_bytes >= festate->cache_max_bytes) &&
+         festate->lru_tail != NULL &&
+         festate->lru_tail != festate->active_cache_entry) {
+    PljsCacheEntry *victim = festate->lru_tail;
+    festate->lru_tail = victim->prev;
+    if (festate->lru_tail)
+      festate->lru_tail->next = NULL;
+    else
+      festate->lru_head = NULL;
+
+    if (victim->store && victim->store != festate->tuplestore) {
+      tuplestore_end(victim->store);
+      victim->store = NULL;
+    }
+    festate->cache_current_bytes -= victim->bytes;
+    if (festate->cache_current_bytes < 0)
+      festate->cache_current_bytes = 0;
+    festate->cache_entry_count--;
+  }
+
   MemoryContext oldcxt = MemoryContextSwitchTo(festate->scan_mcxt);
   PljsCacheEntry *entry =
       (PljsCacheEntry *)palloc0(sizeof(PljsCacheEntry));
@@ -2830,6 +2929,215 @@ static int pljs_fdw_is_foreign_rel_updatable(Relation rel) {
 }
 
 /*
+ * ---------- FDW Direct Modify Callbacks ----------
+ */
+
+static ForeignScan *pljs_fdw_find_modifytable_subplan(PlannerInfo *root,
+                                                      ModifyTable *plan,
+                                                      Index resultRelation,
+                                                      int subplan_index) {
+  (void)root;
+  (void)resultRelation;
+  (void)subplan_index;
+  Plan *subplan = outerPlan(plan);
+  if (subplan && IsA(subplan, ForeignScan)) {
+    return (ForeignScan *)subplan;
+  }
+  return NULL;
+}
+
+static bool pljs_fdw_plan_direct_modify(PlannerInfo *root, ModifyTable *plan,
+                                        Index resultRelation,
+                                        int subplan_index) {
+  CmdType operation = plan->operation;
+  if (operation != CMD_DELETE)
+    return false;
+
+  ForeignScan *fscan = pljs_fdw_find_modifytable_subplan(
+      root, plan, resultRelation, subplan_index);
+  if (!fscan)
+    return false;
+
+  if (fscan->scan.plan.qual != NIL)
+    return false;
+
+  Oid foreigntableid = root->simple_rte_array[resultRelation]->relid;
+  PljsFdwOptions opts;
+  pljs_fdw_get_options(foreigntableid, &opts);
+  const char *dm_opt = pljs_fdw_opt_get(&opts, "direct_modify");
+  if (!dm_opt || (strcmp(dm_opt, "true") != 0 && strcmp(dm_opt, "on") != 0))
+    return false;
+
+  fscan->operation = operation;
+  fscan->resultRelation = resultRelation;
+  fscan->fdw_private = lappend(fscan->fdw_private, makeInteger((int)operation));
+  return true;
+}
+
+static void pljs_fdw_begin_direct_modify(ForeignScanState *node, int eflags) {
+  if (eflags & EXEC_FLAG_EXPLAIN_ONLY) {
+    node->fdw_state = NULL;
+    return;
+  }
+
+  ForeignScan *plan = (ForeignScan *)node->ss.ps.plan;
+  Oid foreigntableid = RelationGetRelid(node->ss.ss_currentRelation);
+  CmdType operation = CMD_UNKNOWN;
+  if (plan->fdw_private != NIL) {
+    Node *last_n = (Node *)llast(plan->fdw_private);
+    if (last_n && IsA(last_n, Integer)) {
+      operation = (CmdType)intVal(last_n);
+    }
+  }
+
+  PljsFdwOptions opts;
+  pljs_fdw_get_options(foreigntableid, &opts);
+
+  MemoryContext direct_mcxt = AllocSetContextCreate(
+      node->ss.ps.state->es_query_cxt, "pljs_fdw direct modify context",
+      ALLOCSET_DEFAULT_SIZES);
+  MemoryContext oldcxt = MemoryContextSwitchTo(direct_mcxt);
+
+  PljsFdwDirectModifyState *dmstate = (PljsFdwDirectModifyState *)palloc0(
+      sizeof(PljsFdwDirectModifyState));
+  dmstate->user_id = GetUserId();
+  dmstate->direct_mcxt = direct_mcxt;
+  dmstate->operation = operation;
+  dmstate->has_executed = false;
+  dmstate->affected_rows = 0;
+  dmstate->set_processed =
+      (node->resultRelInfo == NULL ||
+       node->resultRelInfo->ri_projectReturning == NULL);
+  dmstate->wrapper_instance = JS_UNDEFINED;
+
+  dmstate->cleanup_cb.func = pljs_fdw_direct_modify_cleanup_cb;
+  dmstate->cleanup_cb.arg = dmstate;
+  MemoryContextRegisterResetCallback(direct_mcxt, &dmstate->cleanup_cb);
+
+  dmstate->type_io_flinfo.fn_oid = InvalidOid;
+  dmstate->type_io_flinfo.fn_mcxt = direct_mcxt;
+
+  pljs_encoding_init();
+  pljs_type_io_cache *saved_types =
+      pljs_type_io_enter(&dmstate->type_io_flinfo);
+
+  PG_TRY();
+  {
+    JSContext *ctx = pljs_fdw_get_context();
+    dmstate->ctx = ctx;
+    dmstate->wrapper_instance =
+        pljs_fdw_get_wrapper_instance(ctx, foreigntableid, &opts);
+  }
+  PG_FINALLY();
+  {
+    pljs_type_io_exit(saved_types);
+  }
+  PG_END_TRY();
+
+  TupleDesc tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
+  int n_exprs = list_length(plan->fdw_exprs);
+  if (n_exprs > 0) {
+    dmstate->quals = (PljsQual *)palloc0(sizeof(PljsQual) * (size_t)n_exprs);
+  }
+  ListCell *lc;
+  foreach (lc, plan->fdw_exprs) {
+    Node *clause = (Node *)lfirst(lc);
+    PljsQual q;
+    if (pljs_fdw_extract_qual(clause, plan->scan.scanrelid, tupdesc, &q)) {
+      if (q.is_param && q.right_expr) {
+        q.expr_state = ExecInitExpr((Expr *)q.right_expr, (PlanState *)node);
+      }
+      dmstate->quals[dmstate->quals_count++] = q;
+    }
+  }
+
+  MemoryContextSwitchTo(oldcxt);
+  node->fdw_state = (void *)dmstate;
+}
+
+static TupleTableSlot *pljs_fdw_iterate_direct_modify(ForeignScanState *node) {
+  PljsFdwDirectModifyState *dmstate =
+      (PljsFdwDirectModifyState *)node->fdw_state;
+  TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+  if (!dmstate || dmstate->has_executed) {
+    return ExecClearTuple(slot);
+  }
+
+  dmstate->has_executed = true;
+
+  pljs_encoding_init();
+  pljs_type_io_cache *saved_types =
+      pljs_type_io_enter(&dmstate->type_io_flinfo);
+
+  PG_TRY();
+  {
+    JSContext *ctx = dmstate->ctx;
+    JSValue wrapper = dmstate->wrapper_instance;
+    JSValue dm_fn = JS_GetPropertyStr(ctx, wrapper, "directModify");
+    if (JS_IsFunction(ctx, dm_fn)) {
+      const char *op_str =
+          (dmstate->operation == CMD_UPDATE) ? "UPDATE" : "DELETE";
+      JSValue op_js = JS_NewString(ctx, op_str);
+      ExprContext *econtext = node->ss.ps.ps_ExprContext;
+      JSValue quals_arr = JS_NewArray(ctx);
+      for (int i = 0; i < dmstate->quals_count; i++) {
+        JS_SetPropertyUint32(ctx, quals_arr, (uint32_t)i,
+                             pljs_fdw_qual_to_js(ctx, &dmstate->quals[i],
+                                                 econtext));
+      }
+      JSValue updates_obj = JS_NewObject(ctx);
+      JSValue args[3] = {op_js, quals_arr, updates_obj};
+      JS_UpdateStackTop(JS_GetRuntime(ctx));
+      JSValue ret_val = JS_Call(ctx, dm_fn, wrapper, 3, args);
+      JS_FreeValue(ctx, dm_fn);
+      JS_FreeValue(ctx, op_js);
+      JS_FreeValue(ctx, quals_arr);
+      JS_FreeValue(ctx, updates_obj);
+      if (JS_IsException(ret_val)) {
+        pljs_ereport_js_exception(ctx);
+      }
+      if (JS_IsNumber(ret_val)) {
+        int64_t n = 0;
+        JS_ToInt64(ctx, &n, ret_val);
+        dmstate->affected_rows = (int64)n;
+      }
+      JS_FreeValue(ctx, ret_val);
+    } else {
+      JS_FreeValue(ctx, dm_fn);
+    }
+
+    if (dmstate->set_processed) {
+      node->ss.ps.state->es_processed += dmstate->affected_rows;
+    }
+  }
+  PG_FINALLY();
+  {
+    pljs_type_io_exit(saved_types);
+  }
+  PG_END_TRY();
+
+  return ExecClearTuple(slot);
+}
+
+static void pljs_fdw_end_direct_modify(ForeignScanState *node) {
+  PljsFdwDirectModifyState *dmstate =
+      (PljsFdwDirectModifyState *)node->fdw_state;
+  if (!dmstate)
+    return;
+
+  if (dmstate->ctx != NULL && !JS_IsUndefined(dmstate->wrapper_instance)) {
+    JS_FreeValue(dmstate->ctx, dmstate->wrapper_instance);
+    dmstate->wrapper_instance = JS_UNDEFINED;
+  }
+
+  MemoryContext direct_mcxt = dmstate->direct_mcxt;
+  node->fdw_state = NULL;
+  if (direct_mcxt) {
+    MemoryContextDelete(direct_mcxt);
+  }
+}
+
+/*
  * ---------- FDW Explain, Analyze & Schema Callbacks ----------
  */
 
@@ -2886,7 +3194,7 @@ Datum pljs_fdw_validator(PG_FUNCTION_ARGS) {
 
   static const char *valid_opts[] = {
       "wrapper",       "cache_results", "cache_size", "cache_memory_limit",
-      "rowid_column",  "batch_size",    "key",
+      "rowid_column",  "batch_size",    "key",        "direct_modify",
       NULL};
 
   List *options = untransformRelOptions((Datum)PointerGetDatum(array));
@@ -2931,6 +3239,11 @@ Datum pljs_fdw_handler(PG_FUNCTION_ARGS) {
   routine->ExecForeignDelete = pljs_fdw_exec_foreign_delete;
   routine->EndForeignModify = pljs_fdw_end_foreign_modify;
   routine->IsForeignRelUpdatable = pljs_fdw_is_foreign_rel_updatable;
+
+  routine->PlanDirectModify = pljs_fdw_plan_direct_modify;
+  routine->BeginDirectModify = pljs_fdw_begin_direct_modify;
+  routine->IterateDirectModify = pljs_fdw_iterate_direct_modify;
+  routine->EndDirectModify = pljs_fdw_end_direct_modify;
 
   routine->ExplainForeignScan = pljs_fdw_explain_foreign_scan;
   routine->AnalyzeForeignTable = pljs_fdw_analyze_foreign_table;

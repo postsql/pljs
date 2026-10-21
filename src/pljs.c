@@ -226,6 +226,7 @@ static void pljs_catalog_inval_cb(Datum arg, Oid relid) {
       (relid == InvalidOid || relid != pljs_cached_holder_relid)) {
     pljs_catalog_gen++;
   }
+  pljs_fdw_relcache_cb(arg, relid);
 }
 
 static void pljs_catalog_xact_cb(XactEvent event, void *arg) {

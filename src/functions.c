@@ -51,6 +51,8 @@ static JSValue pljs_plan_cursor_to_string(JSContext *, JSValueConst, int,
                                           JSValueConst *);
 
 static JSValue pljs_plan_free(JSContext *, JSValueConst, int, JSValueConst *);
+static JSValue pljs_plan_return_query(JSContext *, JSValueConst, int,
+                                      JSValueConst *);
 static JSValue pljs_plan_to_string(JSContext *, JSValueConst, int,
                                    JSValueConst *);
 static JSValue pljs_commit(JSContext *, JSValueConst, int, JSValueConst *);
@@ -70,6 +72,8 @@ static JSValue pljs_register_column_inference(JSContext *, JSValueConst, int,
 static JSValue pljs_register_support(JSContext *, JSValueConst, int,
                                      JSValueConst *);
 static JSValue pljs_set_function_columns(JSContext *, JSValueConst, int,
+                                         JSValueConst *);
+static JSValue pljs_set_function_support(JSContext *, JSValueConst, int,
                                          JSValueConst *);
 static JSValue pljs_current_setting(JSContext *, JSValueConst, int,
                                     JSValueConst *);
@@ -459,6 +463,10 @@ void pljs_setup_namespace(JSContext *ctx) {
   JS_SetPropertyStr(ctx, pljs, "set_function_columns",
                     JS_NewCFunction(ctx, pljs_set_function_columns,
                                     "set_function_columns", 2));
+
+  JS_SetPropertyStr(ctx, pljs, "set_function_support",
+                    JS_NewCFunction(ctx, pljs_set_function_support,
+                                    "set_function_support", 1));
 
   JS_SetPropertyStr(
       ctx, pljs, "current_setting",
@@ -1198,6 +1206,7 @@ static JSValue pljs_plan_free(JSContext *ctx, JSValueConst this_val, int argc,
 
 static const JSCFunctionListEntry js_plan_funcs[] = {
     JS_CFUNC_DEF("execute", 2, pljs_plan_execute),
+    JS_CFUNC_DEF("return_query", 2, pljs_plan_return_query),
     JS_CFUNC_DEF("free", 0, pljs_plan_free),
     JS_CFUNC_DEF("cursor", 0, pljs_plan_cursor),
     JS_CFUNC_DEF("toString", 0, pljs_plan_to_string)};
@@ -1442,7 +1451,7 @@ static JSValue pljs_prepare(JSContext *ctx, JSValueConst this_val, int argc,
 
   JSValue ret = JS_NewObject(ctx);
 
-  JS_SetPropertyFunctionList(ctx, ret, js_plan_funcs, 4);
+  JS_SetPropertyFunctionList(ctx, ret, js_plan_funcs, 5);
 
   /* Allocate plan in CacheMemoryContext for the same reason as parstate. */
   plan = MemoryContextAlloc(CacheMemoryContext, sizeof(pljs_plan));
@@ -2966,8 +2975,8 @@ static JSValue pljs_expected_columns(JSContext *ctx, JSValueConst this_val,
 
 static void pljs_stream_spi_to_tuplestore(pljs_storage *storage,
                                           pljs_return_state *retstate,
-                                          uint64 nproc) {
-  if (SPI_tuptable == NULL || nproc == 0) {
+                                          uint64 nproc, bool strict_types) {
+  if (SPI_tuptable == NULL) {
     return;
   }
 
@@ -2977,6 +2986,9 @@ static void pljs_stream_spi_to_tuplestore(pljs_storage *storage,
   if (expected_td->natts == 1 &&
       TupleDescAttr(expected_td, 0)->atttypid == RECORDOID &&
       storage->fcinfo != NULL && storage->fcinfo->resultinfo != NULL) {
+    if (nproc == 0) {
+      return;
+    }
     ReturnSetInfo *rsinfo = (ReturnSetInfo *)storage->fcinfo->resultinfo;
     MemoryContext oldcxt =
         MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
@@ -3004,6 +3016,120 @@ static void pljs_stream_spi_to_tuplestore(pljs_storage *storage,
   for (int a = 0; a < spi_td->natts && n_spi_cols < FUNC_MAX_ARGS; a++) {
     if (!TupleDescAttr(spi_td, a)->attisdropped) {
       spi_cols[n_spi_cols++] = a;
+    }
+  }
+
+  int exp_cols[FUNC_MAX_ARGS];
+  int n_exp_cols = 0;
+  for (int a = 0; a < expected_td->natts && n_exp_cols < FUNC_MAX_ARGS; a++) {
+    if (!TupleDescAttr(expected_td, a)->attisdropped) {
+      exp_cols[n_exp_cols++] = a;
+    }
+  }
+
+  if (strict_types) {
+    if (n_spi_cols != n_exp_cols) {
+      ereport(ERROR,
+              (errcode(ERRCODE_DATATYPE_MISMATCH),
+               errmsg("structure of query does not match function result type"),
+               errdetail("Number of returned columns (%d) does not match "
+                         "expected column count (%d).",
+                         n_spi_cols, n_exp_cols)));
+    }
+    for (int i = 0; i < n_exp_cols; i++) {
+      Form_pg_attribute spi_attr = TupleDescAttr(spi_td, spi_cols[i]);
+      Form_pg_attribute exp_attr = TupleDescAttr(expected_td, exp_cols[i]);
+      if (spi_attr->atttypid != exp_attr->atttypid &&
+          !IsBinaryCoercible(spi_attr->atttypid, exp_attr->atttypid)) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+             errmsg("structure of query does not match function result type"),
+             errdetail("Returned type %s does not match expected type %s in "
+                       "column %d.",
+                       format_type_with_typemod(spi_attr->atttypid,
+                                                spi_attr->atttypmod),
+                       format_type_with_typemod(exp_attr->atttypid,
+                                                exp_attr->atttypmod),
+                       i + 1)));
+      }
+      if (exp_attr->atttypmod != -1 &&
+          spi_attr->atttypmod != exp_attr->atttypmod) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+             errmsg("structure of query does not match function result type"),
+             errdetail("Returned type %s does not match expected type %s in "
+                       "column %d.",
+                       format_type_with_typemod(spi_attr->atttypid,
+                                                spi_attr->atttypmod),
+                       format_type_with_typemod(exp_attr->atttypid,
+                                                exp_attr->atttypmod),
+                       i + 1)));
+      }
+    }
+  }
+
+  if (nproc == 0) {
+    return;
+  }
+
+  bool can_puttuple_direct =
+      (!retstate->is_domain && spi_td->natts == expected_td->natts &&
+       n_spi_cols == expected_td->natts && n_exp_cols == expected_td->natts);
+  if (can_puttuple_direct) {
+    for (int a = 0; a < expected_td->natts; a++) {
+      Form_pg_attribute spi_attr = TupleDescAttr(spi_td, a);
+      Form_pg_attribute exp_attr = TupleDescAttr(expected_td, a);
+      if (spi_attr->atttypid != exp_attr->atttypid &&
+          !IsBinaryCoercible(spi_attr->atttypid, exp_attr->atttypid)) {
+        can_puttuple_direct = false;
+        break;
+      }
+    }
+  }
+
+  if (can_puttuple_direct) {
+    for (uint64 r = 0; r < nproc; r++) {
+      CHECK_FOR_INTERRUPTS();
+      tuplestore_puttuple(retstate->tuple_store_state, SPI_tuptable->vals[r]);
+    }
+    return;
+  }
+
+  Oid col_typoutput[FUNC_MAX_ARGS];
+  Oid col_typinput[FUNC_MAX_ARGS];
+  Oid col_typioparam[FUNC_MAX_ARGS];
+  bool col_direct[FUNC_MAX_ARGS];
+  int max_cols =
+      expected_td->natts < FUNC_MAX_ARGS ? expected_td->natts : FUNC_MAX_ARGS;
+
+  int pre_logical_idx = 0;
+  for (int exp_att = 0; exp_att < max_cols; exp_att++) {
+    Form_pg_attribute exp_attr = TupleDescAttr(expected_td, exp_att);
+    col_typoutput[exp_att] = InvalidOid;
+    col_typinput[exp_att] = InvalidOid;
+    col_typioparam[exp_att] = InvalidOid;
+    col_direct[exp_att] = true;
+    if (exp_attr->attisdropped) {
+      continue;
+    }
+    if (pre_logical_idx >= n_spi_cols) {
+      pre_logical_idx++;
+      continue;
+    }
+    int spi_att = spi_cols[pre_logical_idx++];
+    Form_pg_attribute spi_attr = TupleDescAttr(spi_td, spi_att);
+    if (spi_attr->atttypid == exp_attr->atttypid ||
+        IsBinaryCoercible(spi_attr->atttypid, exp_attr->atttypid)) {
+      col_direct[exp_att] = true;
+    } else {
+      bool typisvarlena = false;
+      col_direct[exp_att] = false;
+      getTypeOutputInfo(spi_attr->atttypid, &col_typoutput[exp_att],
+                        &typisvarlena);
+      getTypeInputInfo(exp_attr->atttypid, &col_typinput[exp_att],
+                       &col_typioparam[exp_att]);
     }
   }
 
@@ -3039,10 +3165,16 @@ static void pljs_stream_spi_to_tuplestore(pljs_storage *storage,
       if (isnull) {
         nulls[exp_att] = true;
         values[exp_att] = (Datum)0;
-      } else if (spi_attr->atttypid == exp_attr->atttypid ||
-                 IsBinaryCoercible(spi_attr->atttypid, exp_attr->atttypid)) {
+      } else if (exp_att < max_cols && col_direct[exp_att]) {
         nulls[exp_att] = false;
         values[exp_att] = d;
+      } else if (exp_att < max_cols) {
+        char *str_val = OidOutputFunctionCall(col_typoutput[exp_att], d);
+        values[exp_att] = OidInputFunctionCall(col_typinput[exp_att], str_val,
+                                               col_typioparam[exp_att],
+                                               exp_attr->atttypmod);
+        nulls[exp_att] = false;
+        pfree(str_val);
       } else {
         Oid typoutput;
         bool typisvarlena;
@@ -3091,15 +3223,25 @@ static JSValue pljs_return_query(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
   }
 
+  bool strict_types = false;
+  int effective_argc = argc;
+  if (argc >= 3 && JS_IsBool(argv[argc - 1]) &&
+      (argc == 3 &&
+       (JS_IsArray(ctx, argv[1]) || JS_IsNull(argv[1]) ||
+        JS_IsUndefined(argv[1])))) {
+    strict_types = (JS_ToBool(ctx, argv[2]) > 0);
+    effective_argc = 2;
+  }
+
   JSValue params = {0};
   bool cleanup_params = false;
   int nparam = 0;
 
-  if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+  if (effective_argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
     if (JS_IsArray(ctx, argv[1])) {
       params = argv[1];
     } else {
-      params = pljs_values_to_array(argv, argc, 1, ctx);
+      params = pljs_values_to_array(argv, effective_argc, 1, ctx);
       cleanup_params = true;
     }
     nparam = pljs_js_array_length(params, ctx);
@@ -3144,7 +3286,7 @@ static JSValue pljs_return_query(JSContext *ctx, JSValueConst this_val,
     nproc = SPI_processed;
 
     if (SPI_tuptable != NULL) {
-      pljs_stream_spi_to_tuplestore(storage, retstate, nproc);
+      pljs_stream_spi_to_tuplestore(storage, retstate, nproc, strict_types);
       SPI_freetuptable(SPI_tuptable);
     }
 
@@ -3172,6 +3314,165 @@ static JSValue pljs_return_query(JSContext *ctx, JSValueConst this_val,
 
   return JS_NewInt32(ctx, (int32_t)nproc);
 }
+
+static JSValue pljs_plan_return_query(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return pljs_throw_ending(ctx);
+  }
+
+  pljs_storage *storage = pljs_current_storage();
+  pljs_return_state *retstate = storage != NULL ? storage->return_state : NULL;
+  if (retstate == NULL || retstate->tuple_store_state == NULL ||
+      retstate->tuple_desc == NULL) {
+    return js_throw("return_query called in context that cannot accept a set",
+                    ctx);
+  }
+
+  bool strict_types = false;
+  int effective_argc = argc;
+  if (argc >= 2 && JS_IsBool(argv[argc - 1]) &&
+      (argc == 2 &&
+       (JS_IsArray(ctx, argv[0]) || JS_IsNull(argv[0]) ||
+        JS_IsUndefined(argv[0])))) {
+    strict_types = (JS_ToBool(ctx, argv[1]) > 0);
+    effective_argc = 1;
+  }
+
+  JSValue params = {0};
+  int nparams = 0;
+  bool cleanup_params = false;
+
+  if (effective_argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+    if (JS_IsArray(ctx, argv[0])) {
+      params = argv[0];
+    } else {
+      params = pljs_values_to_array(argv, effective_argc, 0, ctx);
+      cleanup_params = true;
+    }
+    nparams = pljs_js_array_length(params, ctx);
+    if (nparams < 0) {
+      if (cleanup_params) {
+        JS_FreeValue(ctx, params);
+      }
+      return JS_EXCEPTION;
+    }
+  }
+
+  JSValue handle = JS_GetPropertyStr(ctx, this_val, "plan");
+  pljs_plan *plan = JS_GetOpaque(handle, js_prepared_statement_handle_id);
+
+  if (plan == NULL || plan->plan == NULL) {
+    JS_FreeValue(ctx, handle);
+    if (cleanup_params) {
+      JS_FreeValue(ctx, params);
+    }
+    return js_throw("Invalid plan", ctx);
+  }
+
+  MemoryContext m_mcontext = CurrentMemoryContext;
+  pljs_subxact sx;
+  ErrorData *edata;
+  volatile uint64 nproc = 0;
+
+  pljs_subxact_init(&sx);
+
+  MemoryContext param_context = AllocSetContextCreate(
+      m_mcontext, "PLJS plan return_query parameters", ALLOCSET_SMALL_SIZES);
+
+  PG_TRY();
+  {
+    if (!IsTransactionOrTransactionBlock()) {
+      ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      errmsg("transaction lock failure")));
+    }
+
+    pljs_subxact_begin(&sx, false);
+    MemoryContextSwitchTo(param_context);
+
+    Datum *values = NULL;
+    char *nulls = NULL;
+
+    pljs_plan_params_to_datums(plan, handle, params, nparams, &values, &nulls,
+                               ctx);
+
+    int status;
+    if (plan->parstate) {
+      ParamListInfo paramLI =
+          pljs_setup_variable_paramlist(plan->parstate, values, nulls);
+      status = SPI_execute_plan_with_paramlist(plan->plan, paramLI, false, 0);
+    } else {
+      status = SPI_execute_plan(plan->plan, values, nulls, false, 0);
+    }
+
+    if (status < 0) {
+      elog(ERROR, "plan.return_query failed: %s",
+           SPI_result_code_string(status));
+    }
+
+    nproc = SPI_processed;
+
+    MemoryContextSwitchTo(m_mcontext);
+
+    if (SPI_tuptable != NULL) {
+      pljs_stream_spi_to_tuplestore(storage, retstate, nproc, strict_types);
+      SPI_freetuptable(SPI_tuptable);
+    }
+  }
+  PG_CATCH();
+  {
+    edata = pljs_subxact_abort(&sx);
+    MemoryContextDelete(param_context);
+    JS_FreeValue(ctx, handle);
+    if (cleanup_params) {
+      JS_FreeValue(ctx, params);
+    }
+    return pljs_throw_caught_error(edata, ctx);
+  }
+  PG_END_TRY();
+
+  edata = pljs_subxact_commit(&sx);
+  MemoryContextDelete(param_context);
+  JS_FreeValue(ctx, handle);
+  if (cleanup_params) {
+    JS_FreeValue(ctx, params);
+  }
+  if (edata != NULL) {
+    return pljs_throw_caught_error(edata, ctx);
+  }
+
+  return JS_NewInt32(ctx, (int32_t)nproc);
+}
+
+static JSValue pljs_set_function_support(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return pljs_throw_ending(ctx);
+  }
+  if (argc < 1) {
+    return JS_FALSE;
+  }
+
+  uint32_t fn_oid_u = 0;
+  if (JS_ToUint32(ctx, &fn_oid_u, argv[0]) != 0 || fn_oid_u == 0) {
+    return JS_FALSE;
+  }
+
+  MemoryContext m_mcontext = CurrentMemoryContext;
+  PG_TRY();
+  {
+    pljs_ensure_proc_support((Oid)fn_oid_u);
+  }
+  PG_CATCH();
+  {
+    ErrorData *edata = pljs_catch_error(m_mcontext);
+    return pljs_throw_caught_error(edata, ctx);
+  }
+  PG_END_TRY();
+
+  return JS_TRUE;
+}
+
 static JSValue pljs_register_column_inference(JSContext *ctx,
                                               JSValueConst this_val, int argc,
                                               JSValueConst *argv) {

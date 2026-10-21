@@ -2565,6 +2565,9 @@ Datum pljs_call_validator(PG_FUNCTION_ARGS) {
       if (!pljs_transpile_if_needed(&context, prolang)) {
         elog(ERROR, "failed to transpile function source code");
       }
+      if (context.function->is_srf && OidIsValid(fn_oid)) {
+        pljs_ensure_proc_support(fn_oid);
+      }
     }
     PG_FINALLY();
     {
@@ -2822,6 +2825,17 @@ JSValue pljs_compile_function(pljs_context *context, bool is_trigger) {
 
   if (!pljs_transpile_if_needed(context, InvalidOid)) {
     elog(ERROR, "failed to transpile function source code");
+  }
+  if (context->function->nhandlers > 0 && context->function->is_srf &&
+      OidIsValid(context->function->fn_oid)) {
+    pljs_ensure_proc_support(context->function->fn_oid);
+    HeapTuple upd_tup = SearchSysCache1(
+        PROCOID, ObjectIdGetDatum(context->function->fn_oid));
+    if (HeapTupleIsValid(upd_tup)) {
+      context->function->fn_xmin = HeapTupleHeaderGetRawXmin(upd_tup->t_data);
+      context->function->fn_tid = upd_tup->t_self;
+      ReleaseSysCache(upd_tup);
+    }
   }
 
   context->function->module_generation = 0;
@@ -4578,6 +4592,67 @@ static bool pljs_varlena_attr_equals(HeapTuple tup, TupleDesc tupdesc,
   return eq;
 }
 
+void pljs_ensure_proc_support(Oid fn_oid) {
+  if (!OidIsValid(fn_oid) || XactReadOnly) {
+    return;
+  }
+
+  Oid support_oid = pljs_lookup_func_oid_by_name_nargs("pljs_call_support", 1);
+  if (!OidIsValid(support_oid)) {
+    support_oid = pljs_lookup_func_oid_by_name_nargs("plv8_call_support", 1);
+  }
+  if (!OidIsValid(support_oid)) {
+    return;
+  }
+
+  HeapTuple check_tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+  if (!HeapTupleIsValid(check_tup)) {
+    return;
+  }
+  Form_pg_proc check_form = (Form_pg_proc)GETSTRUCT(check_tup);
+  bool needs_update =
+      (check_form->proretset && !OidIsValid(check_form->prosupport));
+  ReleaseSysCache(check_tup);
+
+  if (!needs_update) {
+    return;
+  }
+
+  Relation proc_rel = table_open(ProcedureRelationId, ShareRowExclusiveLock);
+  HeapTuple tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(fn_oid));
+  if (!HeapTupleIsValid(tup)) {
+    table_close(proc_rel, NoLock);
+    return;
+  }
+  Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(tup);
+  if (!procform->proretset || OidIsValid(procform->prosupport)) {
+    heap_freetuple(tup);
+    table_close(proc_rel, NoLock);
+    return;
+  }
+
+  TupleDesc proc_tupdesc = RelationGetDescr(proc_rel);
+  Datum values[Natts_pg_proc];
+  bool nulls[Natts_pg_proc];
+  bool replaces[Natts_pg_proc];
+  MemSet(values, 0, sizeof(values));
+  MemSet(nulls, false, sizeof(nulls));
+  MemSet(replaces, false, sizeof(replaces));
+
+  values[Anum_pg_proc_prosupport - 1] = ObjectIdGetDatum(support_oid);
+  replaces[Anum_pg_proc_prosupport - 1] = true;
+
+  HeapTuple newtup =
+      heap_modify_tuple(tup, proc_tupdesc, values, nulls, replaces);
+  CatalogTupleUpdate(proc_rel, &newtup->t_self, newtup);
+  pljs_cache_function_update_tuple_id(fn_oid, newtup);
+  heap_freetuple(newtup);
+  heap_freetuple(tup);
+  table_close(proc_rel, NoLock);
+
+  CommandCounterIncrement();
+}
+
 static void pljs_update_proc_table_columns(Oid funcid, int num_out_cols,
                                            const pljs_inferred_col *out_cols,
                                            const char *new_prosrc,
@@ -5838,6 +5913,50 @@ Datum pljs_call_support(PG_FUNCTION_ARGS) {
     char lang_name[NAMEDATALEN];
     lang_name[0] = '\0';
     bool is_custom_lang = false;
+    {
+      HeapTuple proctup =
+          SearchSysCache1(PROCOID, ObjectIdGetDatum(fexpr->funcid));
+      if (HeapTupleIsValid(proctup)) {
+        Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(proctup);
+        Oid prolang = procform->prolang;
+        Oid owner_id = procform->proowner;
+        ReleaseSysCache(proctup);
+        HeapTuple langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(prolang));
+        if (HeapTupleIsValid(langtup)) {
+          Form_pg_language langform = (Form_pg_language)GETSTRUCT(langtup);
+          pljs_normalize_func_name(NameStr(langform->lanname), lang_name,
+                                   sizeof(lang_name));
+          is_custom_lang = (strcmp(lang_name, "pljs") != 0 &&
+                            strcmp(lang_name, "sql") != 0 &&
+                            strcmp(lang_name, "internal") != 0 &&
+                            strcmp(lang_name, "c") != 0);
+          ReleaseSysCache(langtup);
+        }
+
+        if (is_custom_lang) {
+          PljsSupportHookEntry *lang_hook =
+              pljs_find_or_create_hook_entry(lang_name, false);
+          if (lang_hook == NULL || lang_hook->support_ctx == NULL ||
+              !JS_IsFunction(lang_hook->support_ctx,
+                             lang_hook->support_js_cb)) {
+            pljs_in_support_internal_call = true;
+            PG_TRY();
+            {
+              pljs_encoding_init();
+              JSContext *ctx = pljs_get_context(GetUserId(), owner_id);
+              JSValue fn_val = pljs_find_js_function(fexpr->funcid, ctx);
+              JS_FreeValue(ctx, fn_val);
+            }
+            PG_CATCH();
+            {
+              FlushErrorState();
+            }
+            PG_END_TRY();
+            pljs_in_support_internal_call = false;
+          }
+        }
+      }
+    }
 
     PljsSupportHookEntry *hook =
         pljs_find_or_create_hook_entry(func_name, false);

@@ -315,6 +315,7 @@ int pljs_set_func_columns(const char *func_name, int ncols,
                           const pljs_inferred_col *cols);
 void pljs_support_free_context_callbacks(JSContext *ctx);
 uint64 pljs_get_catalog_gen(void);
+void pljs_ensure_proc_support(Oid fn_oid);
 extern bool pljs_preserve_numeric_precision;
 extern bool pljs_pass_user_types_as_bytes;
 

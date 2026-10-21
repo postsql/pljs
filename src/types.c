@@ -89,6 +89,10 @@ static JSClassID JS_CLASS_INT16_ARRAY = 24;
 static JSClassID JS_CLASS_UINT16_ARRAY = 25;
 static JSClassID JS_CLASS_INT32_ARRAY = 26;
 static JSClassID JS_CLASS_UINT32_ARRAY = 27;
+static JSClassID JS_CLASS_BIG_INT64_ARRAY = 28;
+static JSClassID JS_CLASS_BIG_UINT64_ARRAY = 29;
+static JSClassID JS_CLASS_FLOAT32_ARRAY = 0;
+static JSClassID JS_CLASS_FLOAT64_ARRAY = 0;
 
 /**
  * Struct containing the type information for a catch-all*/
@@ -157,6 +161,7 @@ void pljs_free_prop_enum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len) {
  */
 void pljs_type_classes_init(JSContext *ctx) {
   JSValue global, object, bigint, boxed, proxy_ctor, proxy;
+  JSValue f32_ctor, f32, f64_ctor, f64;
   JSValue proxy_args[2];
   JSValue symbol, to_primitive;
 
@@ -189,24 +194,38 @@ void pljs_type_classes_init(JSContext *ctx) {
   proxy_args[1] = JS_NewObject(ctx);
   proxy = JS_CallConstructor(ctx, proxy_ctor, 2, (JSValueConst *)proxy_args);
 
+  f32_ctor = JS_GetPropertyStr(ctx, global, "Float32Array");
+  f32 = JS_CallConstructor(ctx, f32_ctor, 0, NULL);
+  f64_ctor = JS_GetPropertyStr(ctx, global, "Float64Array");
+  f64 = JS_CallConstructor(ctx, f64_ctor, 0, NULL);
+
   JS_FreeValue(ctx, proxy_args[0]);
   JS_FreeValue(ctx, proxy_args[1]);
   JS_FreeValue(ctx, proxy_ctor);
+  JS_FreeValue(ctx, f32_ctor);
+  JS_FreeValue(ctx, f64_ctor);
   JS_FreeValue(ctx, bigint);
   JS_FreeValue(ctx, object);
   JS_FreeValue(ctx, global);
 
-  if (JS_IsException(boxed) || JS_IsException(proxy)) {
+  if (JS_IsException(boxed) || JS_IsException(proxy) || JS_IsException(f32) ||
+      JS_IsException(f64)) {
     JS_FreeValue(ctx, boxed);
     JS_FreeValue(ctx, proxy);
+    JS_FreeValue(ctx, f32);
+    JS_FreeValue(ctx, f64);
     pljs_ereport_js_exception(ctx);
   }
 
   JS_CLASS_PROXY = JS_GetClassID(proxy);
   JS_CLASS_BIG_INT = JS_GetClassID(boxed);
+  JS_CLASS_FLOAT32_ARRAY = JS_GetClassID(f32);
+  JS_CLASS_FLOAT64_ARRAY = JS_GetClassID(f64);
 
   JS_FreeValue(ctx, boxed);
   JS_FreeValue(ctx, proxy);
+  JS_FreeValue(ctx, f32);
+  JS_FreeValue(ctx, f64);
 }
 
 /**
@@ -4213,10 +4232,6 @@ static Datum pljs_jsvalue_to_datum_internal(pljs_type_io *io, int32 typmod,
                        "json or jsonb.")));
   }
 
-  if (type.category == TYPCATEGORY_ARRAY && !JS_IsArray(ctx, val)) {
-    elog(ERROR, "value is not an Array");
-  }
-
   if (type.is_composite) {
     return pljs_jsvalue_to_record(&type, val, is_null, NULL, ctx);
   }
@@ -4225,7 +4240,57 @@ static Datum pljs_jsvalue_to_datum_internal(pljs_type_io *io, int32 typmod,
     return pljs_null_datum(is_null, fcinfo);
   }
 
-  /* The cases below are those of pljs_type_has_js_case(), and only those. */
+  if (type.category == TYPCATEGORY_ARRAY && !JS_IsArray(ctx, val)) {
+    Oid elemtype = InvalidOid;
+    int16 elemsz = 0;
+
+    if (Is_ArrayType(val, JS_CLASS_INT16_ARRAY) ||
+        Is_ArrayType(val, JS_CLASS_UINT16_ARRAY)) {
+      elemtype = INT2OID;
+      elemsz = sizeof(int16);
+    } else if (Is_ArrayType(val, JS_CLASS_INT32_ARRAY) ||
+               Is_ArrayType(val, JS_CLASS_UINT32_ARRAY)) {
+      elemtype = INT4OID;
+      elemsz = sizeof(int32);
+    } else if (Is_ArrayType(val, JS_CLASS_BIG_INT64_ARRAY) ||
+               Is_ArrayType(val, JS_CLASS_BIG_UINT64_ARRAY)) {
+      elemtype = INT8OID;
+      elemsz = sizeof(int64);
+    } else if (Is_ArrayType(val, JS_CLASS_FLOAT32_ARRAY)) {
+      elemtype = FLOAT4OID;
+      elemsz = sizeof(float4);
+    } else if (Is_ArrayType(val, JS_CLASS_FLOAT64_ARRAY)) {
+      elemtype = FLOAT8OID;
+      elemsz = sizeof(float8);
+    }
+
+    if (OidIsValid(elemtype) && elemtype == type.typid && elemsz > 0) {
+      size_t offset = 0, byte_len = 0, psize = 0;
+      JSValue ab = JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, NULL);
+      pljs_checked_value(ctx, ab);
+      uint8_t *data = JS_GetArrayBuffer(ctx, &psize, ab);
+      JS_FreeValue(ctx, ab);
+      if (data == NULL) {
+        pljs_ereport_js_exception(ctx);
+      }
+
+      size_t size = byte_len + ARR_OVERHEAD_NONULLS(1);
+      ArrayType *result = (ArrayType *)palloc0(size);
+      SET_VARSIZE(result, size);
+      result->ndim = 1;
+      result->dataoffset = 0;
+      result->elemtype = elemtype;
+      *ARR_DIMS(result) = (int)(byte_len / (size_t)elemsz);
+      *ARR_LBOUND(result) = 1;
+      if (byte_len > 0) {
+        memcpy(ARR_DATA_PTR(result), data + offset, byte_len);
+      }
+      return PointerGetDatum(result);
+    }
+
+    elog(ERROR, "value is not an Array");
+  }
+
   /* The cases below are those of pljs_type_has_js_case(), and only those. */
   if (!io->has_js_case) {
     /*

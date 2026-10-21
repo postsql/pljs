@@ -136,6 +136,32 @@ DROP FUNCTION test_subxact_unique_violation();
 DROP FUNCTION test_custom_js_sqlstate();
 DROP TABLE subxact_err_tbl;
 
+-- TypedArray return for external array domain and 1-D SQL array
+CREATE DOMAIN pljs_int4array AS int4[];
+
+CREATE FUNCTION test_int4array_typed_return(a pljs_int4array) RETURNS pljs_int4array AS $$
+	return new Int32Array([a[0] + 1, a[1] + 1, a[2] + 1]);
+$$ LANGUAGE pljs;
+
+SELECT test_int4array_typed_return(ARRAY[10, 20, 30]);
+DROP FUNCTION test_int4array_typed_return(pljs_int4array);
+DROP DOMAIN pljs_int4array;
+
+CREATE FUNCTION test_sql_array_typed_return() RETURNS float8[] AS $$
+	return new Float64Array([1.5, 2.5, 3.5]);
+$$ LANGUAGE pljs;
+
+SELECT test_sql_array_typed_return();
+DROP FUNCTION test_sql_array_typed_return();
+
+CREATE FUNCTION test_sql_array_null_return(is_undef bool) RETURNS int4[] AS $$
+	return is_undef ? undefined : null;
+$$ LANGUAGE pljs;
+
+SELECT test_sql_array_null_return(false) IS NULL AS null_ok,
+       test_sql_array_null_return(true) IS NULL AS undef_ok;
+DROP FUNCTION test_sql_array_null_return(bool);
+
 -- preserve_numeric_precision and __numeric_columns jsonb roundtrip
 CREATE FUNCTION num_prec_handler() RETURNS language_handler AS $$
 	if (arguments[1]) arguments[1].preserve_numeric_precision = true;

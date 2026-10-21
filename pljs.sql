@@ -101,3 +101,46 @@ CREATE TRIGGER pljs_modules_changed
   AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON pljs.packages
   FOR EACH STATEMENT EXECUTE FUNCTION pljs_modules_changed();
 ALTER TABLE pljs.packages ENABLE ALWAYS TRIGGER pljs_modules_changed;
+
+CREATE TYPE pljs_source;
+CREATE OR REPLACE FUNCTION pljs_source_in(cstring) RETURNS pljs_source
+ AS 'MODULE_PATHNAME', 'pljs_source_in' LANGUAGE C IMMUTABLE STRICT;
+CREATE OR REPLACE FUNCTION pljs_source_out(pljs_source) RETURNS cstring
+ AS 'MODULE_PATHNAME', 'pljs_source_out' LANGUAGE C IMMUTABLE STRICT;
+CREATE TYPE pljs_source (
+ INPUT = pljs_source_in,
+ OUTPUT = pljs_source_out,
+ INTERNALLENGTH = VARIABLE,
+ STORAGE = EXTENDED,
+ CATEGORY = 'S'
+);
+CREATE CAST (text AS pljs_source) WITH INOUT AS IMPLICIT;
+CREATE CAST (pljs_source AS text) WITH INOUT AS IMPLICIT;
+CREATE CAST (varchar AS pljs_source) WITH INOUT AS IMPLICIT;
+CREATE CAST (pljs_source AS varchar) WITH INOUT AS IMPLICIT;
+
+CREATE OR REPLACE FUNCTION pljs_call_support(internal) RETURNS internal
+ AS 'MODULE_PATHNAME', 'pljs_call_support' LANGUAGE C;
+REVOKE ALL ON FUNCTION pljs_call_support(internal) FROM PUBLIC;
+
+DO $$ BEGIN
+  CREATE TYPE pljs.pljs_single_col_holder AS (__col1 text);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION pljs_inline_helper_0() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_1() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_2() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_3() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_4() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_5() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_6() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+CREATE OR REPLACE FUNCTION pljs_inline_helper_7() RETURNS SETOF record
+ LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;

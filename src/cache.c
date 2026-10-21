@@ -93,6 +93,8 @@ static void pljs_cleanup_context(pljs_context_cache_value *cache_entry) {
   JSValue global_obj = JS_GetGlobalObject(ctx);
   JSValue pljs = JS_GetPropertyStr(ctx, global_obj, "pljs");
 
+  pljs_support_free_context_callbacks(ctx);
+
   /* Free all cached function JSValues for this context. */
   if (cache_entry->function_hash_table != NULL) {
     HASH_SEQ_STATUS fn_status;
@@ -145,6 +147,40 @@ static void pljs_cleanup_context(pljs_context_cache_value *cache_entry) {
   JS_FreeContext(ctx);
   if (runtime != NULL) {
     JS_RunGC(runtime);
+  }
+}
+
+/**
+ * @brief Updates the cached (fn_xmin, fn_tid) identity of a function entry in
+ * every user's cache after an in-place TABLE column signature stamp/reset on
+ * pg_proc that did not change the function body or input arguments.
+ */
+void pljs_cache_function_update_tuple_id(Oid fn_oid, HeapTuple newtup) {
+  HASH_SEQ_STATUS status;
+  pljs_context_cache_value *ctx_hvalue;
+
+  if (pljs_context_HashTable == NULL || !HeapTupleIsValid(newtup)) {
+    return;
+  }
+
+  TransactionId new_xmin = HeapTupleHeaderGetRawXmin(newtup->t_data);
+  ItemPointerData new_tid = newtup->t_self;
+
+  hash_seq_init(&status, pljs_context_HashTable);
+
+  while ((ctx_hvalue = (pljs_context_cache_value *)hash_seq_search(&status)) !=
+         NULL) {
+    if (ctx_hvalue->function_hash_table == NULL) {
+      continue;
+    }
+
+    bool found = false;
+    pljs_function_cache_value *value = (pljs_function_cache_value *)hash_search(
+        ctx_hvalue->function_hash_table, &fn_oid, HASH_FIND, &found);
+    if (found && value != NULL) {
+      value->fn_xmin = new_xmin;
+      value->fn_tid = new_tid;
+    }
   }
 }
 
@@ -247,6 +283,10 @@ void pljs_cache_reset(void) {
 
     while ((ctx_hvalue =
                 (pljs_context_cache_value *)hash_seq_search(&status)) != NULL) {
+      if (ctx_hvalue->ctx != NULL) {
+        pljs_support_free_context_callbacks(ctx_hvalue->ctx);
+      }
+
       if (ctx_hvalue->function_hash_table != NULL) {
         HASH_SEQ_STATUS fstatus;
         pljs_function_cache_value *value;

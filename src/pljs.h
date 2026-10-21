@@ -292,8 +292,30 @@ extern JSClassID js_window_id;
 Datum pljs_call_handler(PG_FUNCTION_ARGS);
 Datum pljs_call_validator(PG_FUNCTION_ARGS);
 Datum pljs_inline_handler(PG_FUNCTION_ARGS);
+Datum pljs_source_in(PG_FUNCTION_ARGS);
+Datum pljs_source_out(PG_FUNCTION_ARGS);
+Datum pljs_call_support(PG_FUNCTION_ARGS);
 Datum pljs_base_type_in(PG_FUNCTION_ARGS);
 Datum pljs_base_type_out(PG_FUNCTION_ARGS);
+
+typedef struct pljs_inferred_col {
+  char name[NAMEDATALEN];
+  Oid type_oid;
+  int32 typmod;
+  Oid collation_oid;
+} pljs_inferred_col;
+
+void pljs_register_col_inference_for_func(const char *func_name,
+                                          const char *sql_func_name,
+                                          JSContext *ctx, JSValueConst cb);
+void pljs_register_support_for_func(const char *func_name,
+                                    const char *sql_func_name, JSContext *ctx,
+                                    JSValueConst cb);
+int pljs_set_func_columns(const char *func_name, int ncols,
+                          const pljs_inferred_col *cols);
+void pljs_support_free_context_callbacks(JSContext *ctx);
+uint64 pljs_get_catalog_gen(void);
+void pljs_ensure_proc_support(Oid fn_oid);
 extern bool pljs_preserve_numeric_precision;
 extern bool pljs_pass_user_types_as_bytes;
 
@@ -376,6 +398,7 @@ pljs_function_cache_value *pljs_cache_function_find_by_ctx(JSContext *ctx,
                                                            HeapTuple proctuple);
 void pljs_cache_function_add(pljs_context *context);
 void pljs_cache_function_remove(Oid fn_oid);
+void pljs_cache_function_update_tuple_id(Oid fn_oid, HeapTuple newtup);
 
 // Serialization and Deserialization
 void pljs_function_cache_to_context(pljs_context *,

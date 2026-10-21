@@ -1,0 +1,409 @@
+CREATE EXTENSION IF NOT EXISTS pljs;
+NOTICE:  extension "pljs" already exists, skipping
+-- =========================================================================
+-- 1. Plain PL/js `RETURNS SETOF record` with `pljs.expected_columns()`
+--    and `pljs.return_query(sql, args)`
+-- =========================================================================
+CREATE TABLE macro_items (
+    id int PRIMARY KEY,
+    category text,
+    price numeric(10, 2)
+);
+INSERT INTO macro_items VALUES
+    (1, 'books', 19.99),
+    (2, 'books', 29.50),
+    (3, 'games', 49.00);
+CREATE OR REPLACE FUNCTION dynamic_filter_items(cat text, min_price numeric)
+RETURNS SETOF record
+LANGUAGE pljs STABLE AS $$
+  const cols = pljs.expected_columns();
+  const selectList = cols.map(c => c.name + '::' + c.type_sql).join(', ');
+  const sql = `SELECT ${selectList} FROM macro_items WHERE category = $1 AND price >= $2 ORDER BY id`;
+  pljs.return_query(sql, [cat, min_price]);
+$$;
+SELECT * FROM dynamic_filter_items('books', 15.00) AS (id int, price numeric(10, 2));
+ id | price 
+----+-------
+  1 | 19.99
+  2 | 29.50
+(2 rows)
+
+-- Calling a `RETURNS SETOF record` function in scalar targetlist context must fail cleanly
+SELECT dynamic_filter_items('books', 15.00);
+ERROR:  function returning record called in context that cannot accept type record
+-- =========================================================================
+-- 2. Parse-time column inference (`pljs_source`) & Planner `prosupport`
+--    inlining (`pljs_call_support`) using in-memory JS hooks
+-- =========================================================================
+DO $$
+  // Parse simple spec: "col1:type1=expr1, col2:type2=expr2 [FROM tbl WHERE ...]"
+  function parseSpec(spec) {
+    const parts = String(spec).split('|');
+    const colPart = parts[0].trim();
+    const fromPart = parts.length > 1 ? parts[1].trim() : '';
+    const cols = colPart.split(',').map(item => {
+      const [decl, expr] = item.trim().split('=');
+      const [name, typeName] = decl.trim().split(':');
+      const rows = pljs.execute(
+        `SELECT oid::int AS type_oid FROM pg_catalog.pg_type WHERE typname = $1`,
+        [typeName.trim()]
+      );
+      const typeOid = (rows && rows.length > 0) ? rows[0].type_oid : 25;
+      return {
+        name: name.trim(),
+        type_name: typeName.trim(),
+        type_oid: typeOid,
+        typmod: -1,
+        collation_oid: 0,
+        expr: expr.trim()
+      };
+    });
+    return { cols, fromPart };
+  }
+
+  pljs.register_column_inference('js_table_macro', function(req) {
+    const parsed = parseSpec(req.source_arg);
+    return {
+      has_coldeflist: req.has_coldeflist,
+      columns: parsed.cols
+    };
+  });
+
+  pljs.register_support('js_table_macro', function(req) {
+    if (String(req.source_arg).indexOf('THROW_SUPPORT_ERR') !== -1) {
+      throw new Error('support hook rejected invalid macro spec');
+    }
+    const parsed = parseSpec(req.source_arg);
+    const outCols = (req.expected_columns && req.expected_columns.length > 0)
+      ? req.expected_columns
+      : parsed.cols;
+
+    let sqlSelect = parsed.cols.map((c, idx) => {
+      const target = outCols[idx] || c;
+      const castType = target.type_sql || c.type_name;
+      const outName = target.name || c.name;
+      return `(${c.expr})::${castType} AS "${outName}"`;
+    }).join(', ');
+
+    // Support lateral correlation via $1 if `outer.<col>` is referenced
+    const lateralVars = [];
+    const outerMatch = parsed.fromPart.match(/outer\.([a-zA-Z0-9_]+)/);
+    if (outerMatch && req.lateral_env && req.lateral_env.length > 0) {
+      const outerRel = req.lateral_env[0];
+      const outerCol = outerRel.columns.find(c => c.name === outerMatch[1]) || outerRel.columns[0];
+      lateralVars.push({
+        rtindex: outerRel.rtindex,
+        attno: outerCol.attno,
+        type_oid: outerCol.type_oid,
+        typmod: outerCol.typmod,
+        collation_oid: outerCol.collation_oid
+      });
+    }
+
+    const fromClause = parsed.fromPart.replace(/outer\.[a-zA-Z0-9_]+/g, '$1');
+    const sql = `SELECT ${sqlSelect} ${fromClause}`;
+    return {
+      sql: sql,
+      columns: outCols,
+      lateral_vars: lateralVars
+    };
+  });
+$$ LANGUAGE pljs;
+CREATE OR REPLACE FUNCTION js_table_macro(spec pljs_source)
+RETURNS SETOF record
+LANGUAGE pljs STABLE SUPPORT pljs_call_support AS $$
+  const cols = pljs.expected_columns();
+  const parts = String(spec).split('|');
+  const colDefs = parts[0].trim().split(',');
+  const fromPart = parts.length > 1 ? parts[1].trim() : '';
+  const selectExprs = colDefs.map((item, idx) => {
+    const [decl, expr] = item.trim().split('=');
+    const target = cols[idx];
+    return `(${expr.trim()})::${target.type_sql} AS "${target.name}"`;
+  }).join(', ');
+  pljs.return_query(`SELECT ${selectExprs} ${fromPart}`);
+$$;
+CREATE OR REPLACE FUNCTION js_table_macro(spec pljs_source, params jsonb)
+RETURNS SETOF record
+LANGUAGE pljs STABLE SUPPORT pljs_call_support AS $$
+  const cols = pljs.expected_columns();
+  const parts = String(spec).split('|');
+  const colDefs = parts[0].trim().split(',');
+  const fromPart = parts.length > 1 ? parts[1].trim() : '';
+  const selectExprs = colDefs.map((item, idx) => {
+    const [decl, expr] = item.trim().split('=');
+    const target = cols[idx];
+    return `(${expr.trim()})::${target.type_sql} AS "${target.name}"`;
+  }).join(', ');
+  pljs.return_query(`SELECT ${selectExprs} ${fromPart}`);
+$$;
+-- 2a. Call WITHOUT `AS (...)` column definition list!
+SELECT * FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id');
+ item_id | item_price 
+---------+------------
+       1 |      19.99
+       2 |      29.50
+(2 rows)
+
+-- 2b. Call WITH `AS (...)` column definition list!
+SELECT * FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''games''')
+  AS (game_id int, cost numeric(10, 2));
+ game_id | cost  
+---------+-------
+       3 | 49.00
+(1 row)
+
+-- 2c. Single-column output without `AS (...)` (uses `pljs.pljs_single_col_holder`)
+SELECT * FROM js_table_macro('item_id:int4=id | FROM macro_items ORDER BY id');
+ item_id 
+---------
+       1
+       2
+       3
+(3 rows)
+
+-- 2d. Verify planner inlining via EXPLAIN (COSTS OFF):
+--     No `Function Scan on js_table_macro`; outer WHERE pushes into index/table scan!
+EXPLAIN (COSTS OFF)
+SELECT * FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items')
+WHERE item_id = 2;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Index Scan using macro_items_pkey on macro_items
+   Index Cond: (id = 2)
+(2 rows)
+
+-- 2e. Verify LATERAL correlation with outer table Var injection ($1)
+CREATE TABLE outer_categories (cat_id int, cat_name text);
+INSERT INTO outer_categories VALUES (100, 'books'), (200, 'games');
+SELECT oc.cat_id, m.item_id, m.item_price
+FROM outer_categories oc,
+     LATERAL js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = outer.cat_name ORDER BY id') m
+ORDER BY oc.cat_id, m.item_id;
+ cat_id | item_id | item_price 
+--------+---------+------------
+    100 |       1 |      19.99
+    100 |       2 |      29.50
+    200 |       3 |      49.00
+(3 rows)
+
+-- 2f. Single-column and multi-column runtime SRF fallback when planner inlining is bypassed (non-Const params)
+SELECT * FROM js_table_macro('item_id:int4=id | FROM macro_items ORDER BY id', jsonb_build_object('k', 1));
+ item_id 
+---------
+       1
+       2
+       3
+(3 rows)
+
+SELECT * FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 1))
+  AS (item_id int, item_price numeric);
+ item_id | item_price 
+---------+------------
+       1 |      19.99
+       2 |      29.50
+(2 rows)
+
+-- 2g. Verify JS exception in pljs.register_support callback is raised cleanly at plan time
+SELECT * FROM js_table_macro('item_id:int4=id | FROM macro_items WHERE THROW_SUPPORT_ERR = 1');
+ERROR:  Error: support hook rejected invalid macro spec
+    at <anonymous> (<function>:37:22)
+
+-- 2h. Multiple dynamic table calls in a single query mixing 1-column and multi-column specs (both orderings)
+SELECT a.item_id, b.item_price
+FROM js_table_macro('item_id:int4=id | FROM macro_items WHERE category = ''books'' ORDER BY id') a
+JOIN js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id') b
+  ON a.item_id = b.item_id
+ORDER BY a.item_id;
+ item_id | item_price 
+---------+------------
+       1 |      19.99
+       2 |      29.50
+(2 rows)
+
+SELECT b.item_id, b.item_price, a.only_id
+FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id') b
+JOIN js_table_macro('only_id:int4=id | FROM macro_items WHERE category = ''books'' ORDER BY id') a
+  ON b.item_id = a.only_id
+ORDER BY b.item_id;
+ item_id | item_price | only_id 
+---------+------------+---------
+       1 |      19.99 |       1
+       2 |      29.50 |       2
+(2 rows)
+
+-- 2i. Multiple 1-column inlined calls with different column names and types in the same query
+SELECT a.only_id, b.only_cat
+FROM js_table_macro('only_id:int4=id | FROM macro_items WHERE id = 1') a,
+     js_table_macro('only_cat:text=category | FROM macro_items WHERE id = 1') b;
+ only_id | only_cat 
+---------+----------
+       1 | books
+(1 row)
+
+-- 2j. Two calls with identical source_str where the first uses runtime fallback and the second is inlined
+SELECT a.item_id AS a_id, b.item_id AS b_id
+FROM js_table_macro('item_id:int4=id | FROM macro_items WHERE id = 1', jsonb_build_object('k', 1)) a
+JOIN js_table_macro('item_id:int4=id | FROM macro_items WHERE id = 1', '{"k": 1}'::jsonb) b
+  ON a.item_id = b.item_id;
+ a_id | b_id 
+------+------
+    1 |    1
+(1 row)
+
+-- 2k. Multiple runtime SRF fallback calls without AS (...) in a single query (2-col JOIN 1-col, 1-col JOIN 2-col, and two 1-col with different types)
+SELECT b.item_id, b.item_price, a.only_id
+FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 1)) b
+JOIN js_table_macro('only_id:int4=id | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 2)) a
+  ON b.item_id = a.only_id
+ORDER BY b.item_id;
+ item_id | item_price | only_id 
+---------+------------+---------
+       1 |      19.99 |       1
+       2 |      29.50 |       2
+(2 rows)
+
+SELECT a.only_id, b.item_id, b.item_price
+FROM js_table_macro('only_id:int4=id | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 1)) a
+JOIN js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 2)) b
+  ON a.only_id = b.item_id
+ORDER BY a.only_id;
+ only_id | item_id | item_price 
+---------+---------+------------
+       1 |       1 |      19.99
+       2 |       2 |      29.50
+(2 rows)
+
+SELECT a.only_id, b.only_cat
+FROM js_table_macro('only_id:int4=id | FROM macro_items WHERE id = 1', jsonb_build_object('k', 1)) a,
+     js_table_macro('only_cat:text=category | FROM macro_items WHERE id = 1', jsonb_build_object('k', 2)) b
+ORDER BY b.only_cat;
+ only_id | only_cat 
+---------+----------
+       1 | books
+(1 row)
+
+CREATE OR REPLACE FUNCTION js_rn_macro(spec pljs_source, extra jsonb)
+RETURNS SETOF record
+LANGUAGE pljs STABLE AS $$
+  const s = String(spec);
+  if (s.startsWith('item_id:int4')) {
+    pljs.return_next({ item_id: 42, cat_name: 'hello_world' });
+  } else {
+    pljs.return_next({ cat_label: 'hello_world', game_id: 42 });
+  }
+$$;
+DO $$
+  pljs.register_column_inference('js_rn_macro', function(req) {
+    const s = String(req.source_arg || '');
+    if (s.startsWith('item_id:int4')) {
+      return [
+        { name: 'item_id', type_oid: 23, typmod: -1, collation_oid: 0 },
+        { name: 'cat_name', type_oid: 25, typmod: -1, collation_oid: 0 }
+      ];
+    }
+    return [
+      { name: 'cat_label', type_oid: 25, typmod: -1, collation_oid: 0 },
+      { name: 'game_id', type_oid: 23, typmod: -1, collation_oid: 0 }
+    ];
+  });
+$$ LANGUAGE pljs;
+SELECT a.item_id, a.cat_name, b.cat_label, b.game_id
+FROM js_rn_macro('item_id:int4=id, cat_name:text=category | FROM macro_items WHERE id = 1', jsonb_build_object('k', 1)) a,
+     js_rn_macro('cat_label:text=category, game_id:int4=id | FROM macro_items WHERE id = 3', jsonb_build_object('k', 2)) b
+ORDER BY a.cat_name, b.cat_label;
+ item_id |  cat_name   |  cat_label  | game_id 
+---------+-------------+-------------+---------
+      42 | hello_world | hello_world |      42
+(1 row)
+
+DROP FUNCTION js_rn_macro(pljs_source, jsonb);
+-- 2l. Single quotes in first 32 chars, dollar-quoted literals, >32-char prefix multi-call mixing AS (...) and inferred columns, simultaneous FROM + SELECT targetlist SRF, and ROWS FROM
+SELECT * FROM js_table_macro('tag:text=''books'' | FROM macro_items WHERE id = 1');
+  tag  
+-------
+ books
+(1 row)
+
+SELECT * FROM js_table_macro($$tag:text='games' | FROM macro_items WHERE id = 3$$);
+  tag  
+-------
+ games
+(1 row)
+
+SELECT a.game_id, a.cost, b.item_id, b.item_price
+FROM js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''games''') AS a(game_id int, cost numeric(10, 2)),
+     js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id') b
+ORDER BY b.item_id;
+ game_id | cost  | item_id | item_price 
+---------+-------+---------+------------
+       3 | 49.00 |       1 |      19.99
+       3 | 49.00 |       2 |      29.50
+(2 rows)
+
+SELECT m.item_id, js_table_macro('cat_name:text=category | FROM macro_items WHERE id = 1', jsonb_build_object('k', 2)) AS target_srf
+FROM js_table_macro('item_id:int4=id | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 1)) m
+ORDER BY m.item_id;
+ item_id | target_srf 
+---------+------------
+       1 | (books)
+       2 | (books)
+(2 rows)
+
+SELECT r.item_id, r.item_price, r.g, c.only_cat
+FROM ROWS FROM (
+  js_table_macro('item_id:int4=id, item_price:numeric=price | FROM macro_items WHERE category = ''books'' ORDER BY id', jsonb_build_object('k', 1)),
+  generate_series(10, 20, 10)
+) AS r(item_id, item_price, g),
+js_table_macro('only_cat:text=category | FROM macro_items WHERE id = 1', jsonb_build_object('k', 2)) c
+ORDER BY r.item_id;
+ item_id | item_price | g  | only_cat 
+---------+------------+----+----------
+       1 |      19.99 | 10 | books
+       2 |      29.50 | 20 | books
+(2 rows)
+
+-- =========================================================================
+-- 3. Custom compiled-to-JS language (`LANGUAGE pl_query_macro`) using
+--    `pljs.set_function_columns()` and `pljs.return_query()`
+-- =========================================================================
+CREATE OR REPLACE FUNCTION pl_query_macro_handler()
+RETURNS language_handler
+LANGUAGE pljs AS $$
+  const src = arguments[0];
+  return `
+    const cols = pljs.expected_columns();
+    const sql = (${JSON.stringify(src.trim())});
+    pljs.return_query(sql);
+  `;
+$$;
+CREATE TRUSTED LANGUAGE pl_query_macro
+  HANDLER pl_query_macro_handler
+  VALIDATOR pljs_call_validator;
+CREATE OR REPLACE FUNCTION top_books_macro()
+RETURNS SETOF record
+LANGUAGE pl_query_macro STABLE AS $$
+  SELECT id, price FROM macro_items WHERE category = 'books' ORDER BY id
+$$;
+-- Stamp output columns onto `top_books_macro` from JS via `pljs.set_function_columns`
+DO $$
+  pljs.set_function_columns('top_books_macro', [
+    { name: 'book_id', type_oid: 23 },
+    { name: 'book_price', type_oid: 1700 }
+  ]);
+$$ LANGUAGE pljs;
+SELECT * FROM top_books_macro();
+ book_id | book_price 
+---------+------------
+       1 |      19.99
+       2 |      29.50
+(2 rows)
+
+DROP FUNCTION top_books_macro();
+DROP LANGUAGE pl_query_macro;
+DROP FUNCTION pl_query_macro_handler();
+DROP TABLE outer_categories;
+DROP FUNCTION js_table_macro(pljs_source);
+DROP FUNCTION js_table_macro(pljs_source, jsonb);
+DROP FUNCTION dynamic_filter_items(text, numeric);
+DROP TABLE macro_items;

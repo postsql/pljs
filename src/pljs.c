@@ -1,8 +1,13 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_language.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
@@ -12,14 +17,29 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/pathnodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/optimizer.h"
 #include "parser/parse_func.h"
+#include "parser/parse_relation.h"
+#include "parser/parse_type.h"
 #include "tcop/tcopprot.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
+#include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/palloc.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "deps/quickjs/quickjs.h"
@@ -27,6 +47,7 @@
 
 #include "pljs.h"
 
+#include <ctype.h>
 #include <string.h>
 
 #if PG_VERSION_NUM >= 180000
@@ -38,6 +59,9 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pljs_call_handler);
 PG_FUNCTION_INFO_V1(pljs_call_validator);
 PG_FUNCTION_INFO_V1(pljs_inline_handler);
+PG_FUNCTION_INFO_V1(pljs_source_in);
+PG_FUNCTION_INFO_V1(pljs_source_out);
+PG_FUNCTION_INFO_V1(pljs_call_support);
 PG_FUNCTION_INFO_V1(pljs_base_type_in);
 PG_FUNCTION_INFO_V1(pljs_base_type_out);
 
@@ -63,6 +87,7 @@ static void pljs_run_with_storage(JSContext *ctx, pljs_func *function,
                                   void (*run)(void *), void *arg);
 static void pljs_raise_if_ending(void);
 static bool pljs_argmode_is_input(char argmode);
+static void pljs_reset_all_stamped_procs(void);
 
 /** \brief QuickJS Runtime */
 JSRuntime *rt = NULL;
@@ -190,6 +215,33 @@ void pljs_runtime_init(void) {
   pljs_hooks_init(rt);
 }
 
+static uint64 pljs_catalog_gen = 1;
+static Oid pljs_cached_holder_relid = InvalidOid;
+static bool pljs_in_internal_catalog_update = false;
+
+uint64 pljs_get_catalog_gen(void) { return pljs_catalog_gen; }
+
+static void pljs_catalog_inval_cb(Datum arg, Oid relid) {
+  if (!pljs_in_internal_catalog_update &&
+      (relid == InvalidOid || relid != pljs_cached_holder_relid)) {
+    pljs_catalog_gen++;
+  }
+}
+
+static void pljs_catalog_xact_cb(XactEvent event, void *arg) {
+  if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT) {
+    pljs_catalog_gen++;
+  }
+}
+
+static void pljs_catalog_subxact_cb(SubXactEvent event,
+                                    SubTransactionId mySubid,
+                                    SubTransactionId parentSubid, void *arg) {
+  if (event == SUBXACT_EVENT_ABORT_SUB) {
+    pljs_catalog_gen++;
+  }
+}
+
 /**
  * @brief PostgreSQL extension initialization function.
  *
@@ -218,6 +270,11 @@ void _PG_init(void) {
 
   // Notice changes to the module tables.
   pljs_modules_init();
+
+  // Track external relation/catalog invalidations and transaction aborts.
+  CacheRegisterRelcacheCallback(pljs_catalog_inval_cb, (Datum)0);
+  RegisterXactCallback(pljs_catalog_xact_cb, NULL);
+  RegisterSubXactCallback(pljs_catalog_subxact_cb, NULL);
 
   // Install hook callbacks.
   pljs_hooks_install();
@@ -828,7 +885,6 @@ void pljs_ereport_js_exception(JSContext *ctx) {
 
   pljs_ereport_js_error_info(&errinfo, "could not convert a JavaScript value");
 }
-
 
 static int interrupt_handler(JSRuntime *rt, void *opaque) {
   /*
@@ -2055,6 +2111,7 @@ Datum pljs_call_handler(PG_FUNCTION_ARGS) {
   pljs_type_io_cache *types;
   Datum retval;
 
+  pljs_reset_all_stamped_procs();
   pljs_encoding_init();
   types = pljs_type_io_enter(fcinfo->flinfo);
 
@@ -3441,8 +3498,13 @@ static Datum call_srf_function(FunctionCallInfo fcinfo, pljs_context *context,
    */
   typeclass = get_call_result_type(fcinfo, &state->rettype, NULL);
 
+  bool has_concrete_expected_desc =
+      (rsinfo->expectedDesc != NULL && rsinfo->expectedDesc->natts > 0 &&
+       TupleDescAttr(rsinfo->expectedDesc, 0)->atttypid != RECORDOID);
+
   /* A record with no column definition list to say what its columns are. */
-  if (typeclass == TYPEFUNC_RECORD) {
+  if ((typeclass == TYPEFUNC_RECORD && !has_concrete_expected_desc) ||
+      rsinfo->expectedDesc == NULL) {
     ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmsg("function returning record called in context "
                            "that cannot accept type record")));
@@ -3467,7 +3529,10 @@ static Datum call_srf_function(FunctionCallInfo fcinfo, pljs_context *context,
    * checked either.
    */
   state->is_domain = typeclass == TYPEFUNC_COMPOSITE_DOMAIN;
-  state->is_composite = typeclass == TYPEFUNC_COMPOSITE || state->is_domain;
+  state->is_composite = typeclass == TYPEFUNC_COMPOSITE || state->is_domain ||
+                        (typeclass == TYPEFUNC_RECORD &&
+                         has_concrete_expected_desc &&
+                         state->tuple_desc->natts > 1);
   state->row_context =
       state->is_domain
           ? AllocSetContextCreate(execution_context, "PLJS Domain Row",
@@ -4001,6 +4066,2968 @@ JSValue pljs_find_js_function(Oid fn_oid, JSContext *ctx) {
   }
 
   return func;
+}
+
+/* ============================================================================
+ * Table-Macro & Planner Support-Hook Subsystem
+ * (pljs_source_in, pljs_source_out, pljs_call_support)
+ * ============================================================================
+ */
+
+#define PLJS_NUM_INLINE_HELPERS 8
+#define PLJS_MAX_INFERRED_CACHE 16
+#define PLJS_MAX_HOOK_ENTRIES   32
+#define PLJS_MAX_STAMPED_OIDS   64
+
+typedef struct PljsInferredEntry {
+  char *func_name;
+  char *source_str;
+  char *first_arg;
+  int ncols;
+  pljs_inferred_col *cols;
+} PljsInferredEntry;
+
+typedef struct PljsSupportHookEntry {
+  bool in_use;
+  char func_name[NAMEDATALEN];
+  char infer_sql_func[NAMEDATALEN];
+  char support_sql_func[NAMEDATALEN];
+  JSContext *infer_ctx;
+  JSValue infer_js_cb;
+  JSContext *support_ctx;
+  JSValue support_js_cb;
+} PljsSupportHookEntry;
+
+static PljsInferredEntry pljs_inferred_cache[PLJS_MAX_INFERRED_CACHE];
+static int pljs_inferred_cache_next = 0;
+
+static PljsSupportHookEntry pljs_hook_registry[PLJS_MAX_HOOK_ENTRIES];
+static bool pljs_hook_registry_initialized = false;
+
+static Oid pljs_stamped_oids[PLJS_MAX_STAMPED_OIDS];
+static int pljs_num_stamped_oids = 0;
+
+static bool pljs_in_support_internal_call = false;
+
+static uint64 pljs_fnv1a64(uint64 h, const void *data, size_t len) {
+  const unsigned char *p = (const unsigned char *)data;
+  for (size_t i = 0; i < len; i++) {
+    h ^= (uint64)p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+static void pljs_ensure_hook_registry_init(void) {
+  if (!pljs_hook_registry_initialized) {
+    for (int i = 0; i < PLJS_MAX_HOOK_ENTRIES; i++) {
+      pljs_hook_registry[i].in_use = false;
+      pljs_hook_registry[i].func_name[0] = '\0';
+      pljs_hook_registry[i].infer_sql_func[0] = '\0';
+      pljs_hook_registry[i].support_sql_func[0] = '\0';
+      pljs_hook_registry[i].infer_ctx = NULL;
+      pljs_hook_registry[i].infer_js_cb = JS_UNDEFINED;
+      pljs_hook_registry[i].support_ctx = NULL;
+      pljs_hook_registry[i].support_js_cb = JS_UNDEFINED;
+    }
+    pljs_hook_registry_initialized = true;
+  }
+}
+
+static void pljs_normalize_func_name(const char *raw, char *out, size_t out_sz) {
+  if (raw == NULL || out_sz == 0) {
+    if (out_sz > 0) {
+      out[0] = '\0';
+    }
+    return;
+  }
+
+  const char *dot = strrchr(raw, '.');
+  const char *p = dot ? (dot + 1) : raw;
+  size_t idx = 0;
+
+  while (*p != '\0' && idx + 1 < out_sz) {
+    unsigned char c = (unsigned char)*p++;
+    if (c == '"') {
+      continue;
+    }
+    if (c >= 'A' && c <= 'Z') {
+      c = (unsigned char)(c - 'A' + 'a');
+    }
+    out[idx++] = (char)c;
+  }
+  out[idx] = '\0';
+}
+
+static PljsSupportHookEntry *pljs_find_or_create_hook_entry(const char *func_name,
+                                                            bool create) {
+  pljs_ensure_hook_registry_init();
+  char norm[NAMEDATALEN];
+  pljs_normalize_func_name(func_name, norm, sizeof(norm));
+  if (norm[0] == '\0') {
+    return NULL;
+  }
+
+  int free_slot = -1;
+  for (int i = 0; i < PLJS_MAX_HOOK_ENTRIES; i++) {
+    if (pljs_hook_registry[i].in_use &&
+        strcmp(pljs_hook_registry[i].func_name, norm) == 0) {
+      return &pljs_hook_registry[i];
+    }
+    if (!pljs_hook_registry[i].in_use && free_slot < 0) {
+      free_slot = i;
+    }
+  }
+
+  if (!create || free_slot < 0) {
+    return NULL;
+  }
+
+  PljsSupportHookEntry *e = &pljs_hook_registry[free_slot];
+  e->in_use = true;
+  strlcpy(e->func_name, norm, sizeof(e->func_name));
+  e->infer_sql_func[0] = '\0';
+  e->support_sql_func[0] = '\0';
+  e->infer_ctx = NULL;
+  e->infer_js_cb = JS_UNDEFINED;
+  e->support_ctx = NULL;
+  e->support_js_cb = JS_UNDEFINED;
+  return e;
+}
+
+void pljs_support_free_context_callbacks(JSContext *ctx) {
+  if (ctx == NULL || !pljs_hook_registry_initialized) {
+    return;
+  }
+
+  for (int i = 0; i < PLJS_MAX_HOOK_ENTRIES; i++) {
+    if (!pljs_hook_registry[i].in_use) {
+      continue;
+    }
+    if (pljs_hook_registry[i].infer_ctx == ctx) {
+      JS_FreeValue(ctx, pljs_hook_registry[i].infer_js_cb);
+      pljs_hook_registry[i].infer_js_cb = JS_UNDEFINED;
+      pljs_hook_registry[i].infer_ctx = NULL;
+    }
+    if (pljs_hook_registry[i].support_ctx == ctx) {
+      JS_FreeValue(ctx, pljs_hook_registry[i].support_js_cb);
+      pljs_hook_registry[i].support_js_cb = JS_UNDEFINED;
+      pljs_hook_registry[i].support_ctx = NULL;
+    }
+  }
+}
+
+void pljs_register_col_inference_for_func(const char *func_name,
+                                          const char *sql_func_name,
+                                          JSContext *ctx, JSValueConst cb) {
+  PljsSupportHookEntry *e = pljs_find_or_create_hook_entry(func_name, true);
+  if (e == NULL) {
+    return;
+  }
+
+  if (e->infer_ctx != NULL && !JS_IsUndefined(e->infer_js_cb)) {
+    JS_FreeValue(e->infer_ctx, e->infer_js_cb);
+  }
+  e->infer_ctx = NULL;
+  e->infer_js_cb = JS_UNDEFINED;
+  e->infer_sql_func[0] = '\0';
+
+  if (ctx != NULL && JS_IsFunction(ctx, cb)) {
+    e->infer_ctx = ctx;
+    e->infer_js_cb = JS_DupValue(ctx, cb);
+  } else if (sql_func_name != NULL && sql_func_name[0] != '\0') {
+    strlcpy(e->infer_sql_func, sql_func_name, sizeof(e->infer_sql_func));
+  }
+}
+
+void pljs_register_support_for_func(const char *func_name,
+                                    const char *sql_func_name, JSContext *ctx,
+                                    JSValueConst cb) {
+  PljsSupportHookEntry *e = pljs_find_or_create_hook_entry(func_name, true);
+  if (e == NULL) {
+    return;
+  }
+
+  if (e->support_ctx != NULL && !JS_IsUndefined(e->support_js_cb)) {
+    JS_FreeValue(e->support_ctx, e->support_js_cb);
+  }
+  e->support_ctx = NULL;
+  e->support_js_cb = JS_UNDEFINED;
+  e->support_sql_func[0] = '\0';
+
+  if (ctx != NULL && JS_IsFunction(ctx, cb)) {
+    e->support_ctx = ctx;
+    e->support_js_cb = JS_DupValue(ctx, cb);
+  } else if (sql_func_name != NULL && sql_func_name[0] != '\0') {
+    strlcpy(e->support_sql_func, sql_func_name, sizeof(e->support_sql_func));
+  }
+}
+
+static void pljs_save_inferred_columns(const char *func_name,
+                                       const char *source_str,
+                                       const char *first_arg, int ncols,
+                                       const pljs_inferred_col *cols) {
+  if (ncols <= 0 || source_str == NULL) {
+    return;
+  }
+
+  MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+  PljsInferredEntry *slot = &pljs_inferred_cache[pljs_inferred_cache_next];
+  pljs_inferred_cache_next =
+      (pljs_inferred_cache_next + 1) % PLJS_MAX_INFERRED_CACHE;
+
+  if (slot->func_name != NULL) {
+    pfree(slot->func_name);
+  }
+  if (slot->source_str != NULL) {
+    pfree(slot->source_str);
+  }
+  if (slot->first_arg != NULL) {
+    pfree(slot->first_arg);
+  }
+  if (slot->cols != NULL) {
+    pfree(slot->cols);
+  }
+
+  slot->func_name = pstrdup(func_name ? func_name : "");
+  slot->source_str = pstrdup(source_str);
+  slot->first_arg = first_arg ? pstrdup(first_arg) : NULL;
+  slot->ncols = ncols;
+  slot->cols =
+      (pljs_inferred_col *)palloc0(sizeof(pljs_inferred_col) * ncols);
+  for (int i = 0; i < ncols; i++) {
+    CHECK_FOR_INTERRUPTS();
+    strlcpy(slot->cols[i].name,
+            cols[i].name[0] ? cols[i].name : "?column?", NAMEDATALEN);
+    slot->cols[i].type_oid = cols[i].type_oid;
+    slot->cols[i].typmod = cols[i].typmod;
+    slot->cols[i].collation_oid = cols[i].collation_oid;
+  }
+
+  MemoryContextSwitchTo(oldcxt);
+}
+
+static PljsInferredEntry *pljs_find_inferred_columns(const char *source_str) {
+  if (source_str == NULL) {
+    return NULL;
+  }
+
+  for (int i = 0; i < PLJS_MAX_INFERRED_CACHE; i++) {
+    int idx = (pljs_inferred_cache_next - 1 - i + PLJS_MAX_INFERRED_CACHE) %
+              PLJS_MAX_INFERRED_CACHE;
+
+    CHECK_FOR_INTERRUPTS();
+    if (pljs_inferred_cache[idx].source_str != NULL &&
+        strcmp(pljs_inferred_cache[idx].source_str, source_str) == 0) {
+      return &pljs_inferred_cache[idx];
+    }
+  }
+  return NULL;
+}
+
+static Oid pljs_lookup_func_oid_by_name_nargs(const char *funcname, int nargs) {
+  if (funcname == NULL || funcname[0] == '\0') {
+    return InvalidOid;
+  }
+
+  Oid result = InvalidOid;
+  CatCList *catlist =
+      SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+  for (int i = 0; i < catlist->n_members; i++) {
+    HeapTuple proctup = &catlist->members[i]->tuple;
+    Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(proctup);
+
+    CHECK_FOR_INTERRUPTS();
+    if (nargs < 0 || procform->pronargs == nargs) {
+      result = procform->oid;
+      break;
+    }
+  }
+  ReleaseSysCacheList(catlist);
+  return result;
+}
+
+static Oid pljs_find_infer_sql_func_oid(const char *func_name) {
+  PljsSupportHookEntry *e = pljs_find_or_create_hook_entry(func_name, false);
+  if (e != NULL && e->infer_sql_func[0] != '\0') {
+    Oid oid = pljs_lookup_func_oid_by_name_nargs(e->infer_sql_func, 2);
+    if (OidIsValid(oid)) {
+      return oid;
+    }
+  }
+
+  char candidate[NAMEDATALEN * 2];
+  snprintf(candidate, sizeof(candidate), "%s_infer_columns",
+           (func_name && func_name[0] != '\0') ? func_name : "graph_table");
+  Oid oid = pljs_lookup_func_oid_by_name_nargs(candidate, 2);
+  if (OidIsValid(oid)) {
+    return oid;
+  }
+
+  if (func_name == NULL || func_name[0] == '\0' ||
+      strcmp(func_name, "graph_table") == 0) {
+    oid = pljs_lookup_func_oid_by_name_nargs("pgq_infer_columns_tsv", 2);
+    if (OidIsValid(oid)) {
+      return oid;
+    }
+  }
+
+  return InvalidOid;
+}
+
+static Oid pljs_find_support_sql_func_oid(const char *func_name) {
+  PljsSupportHookEntry *e = pljs_find_or_create_hook_entry(func_name, false);
+  if (e != NULL && e->support_sql_func[0] != '\0') {
+    Oid oid = pljs_lookup_func_oid_by_name_nargs(e->support_sql_func, 5);
+    if (OidIsValid(oid)) {
+      return oid;
+    }
+  }
+
+  char candidate[NAMEDATALEN * 2];
+  snprintf(candidate, sizeof(candidate), "%s_support",
+           (func_name && func_name[0] != '\0') ? func_name : "graph_table");
+  Oid oid = pljs_lookup_func_oid_by_name_nargs(candidate, 5);
+  if (OidIsValid(oid)) {
+    return oid;
+  }
+
+  if (func_name == NULL || func_name[0] == '\0' ||
+      strcmp(func_name, "graph_table") == 0) {
+    oid = pljs_lookup_func_oid_by_name_nargs("pgq_compile_graph_table_tsv", 5);
+    if (OidIsValid(oid)) {
+      return oid;
+    }
+  }
+
+  return InvalidOid;
+}
+
+static Oid pljs_update_single_col_holder_type(const pljs_inferred_col *col) {
+  static const char *holder_names[] = {
+      "pljs_single_col_holder",
+      "plv8_single_col_holder",
+      "plpgq_single_col_holder",
+      NULL,
+  };
+  Oid holder_type_oid = InvalidOid;
+  Oid holder_relid = InvalidOid;
+
+  if (col == NULL || XactReadOnly) {
+    return InvalidOid;
+  }
+
+  for (int h = 0; holder_names[h] != NULL && !OidIsValid(holder_type_oid);
+       h++) {
+    CatCList *catlist =
+        SearchSysCacheList1(TYPENAMENSP, CStringGetDatum(holder_names[h]));
+    for (int i = 0; i < catlist->n_members; i++) {
+      HeapTuple ttup = &catlist->members[i]->tuple;
+      Form_pg_type tform = (Form_pg_type)GETSTRUCT(ttup);
+
+      CHECK_FOR_INTERRUPTS();
+      if (tform->typtype == TYPTYPE_COMPOSITE && OidIsValid(tform->typrelid)) {
+        holder_type_oid = tform->oid;
+        holder_relid = tform->typrelid;
+        break;
+      }
+    }
+    ReleaseSysCacheList(catlist);
+  }
+
+  if (!OidIsValid(holder_type_oid) || !OidIsValid(holder_relid)) {
+    return InvalidOid;
+  }
+
+  pljs_cached_holder_relid = holder_relid;
+
+  HeapTuple typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(col->type_oid));
+  if (!HeapTupleIsValid(typtup)) {
+    return InvalidOid;
+  }
+  Form_pg_type typform = (Form_pg_type)GETSTRUCT(typtup);
+  int16 typlen = typform->typlen;
+  bool typbyval = typform->typbyval;
+  char typalign = typform->typalign;
+  char typstorage = typform->typstorage;
+  char typcategory = typform->typcategory;
+  Oid typcollation = typform->typcollation;
+  ReleaseSysCache(typtup);
+
+  const char *desired_name = (col->name[0] != '\0') ? col->name : "?column?";
+  Oid desired_coll =
+      OidIsValid(col->collation_oid) ? col->collation_oid : typcollation;
+  int16 desired_ndims = (typcategory == TYPCATEGORY_ARRAY) ? 1 : 0;
+
+  HeapTuple cur_atttup = SearchSysCache2(ATTNUM, ObjectIdGetDatum(holder_relid),
+                                         Int16GetDatum(1));
+  if (HeapTupleIsValid(cur_atttup)) {
+    Form_pg_attribute cur_att = (Form_pg_attribute)GETSTRUCT(cur_atttup);
+    bool same =
+        (strncmp(NameStr(cur_att->attname), desired_name, NAMEDATALEN - 1) ==
+             0 &&
+         cur_att->atttypid == col->type_oid &&
+         cur_att->atttypmod == col->typmod &&
+         cur_att->attcollation == desired_coll &&
+         cur_att->attndims == desired_ndims);
+    ReleaseSysCache(cur_atttup);
+    if (same) {
+      return holder_type_oid;
+    }
+  }
+
+  Relation attrel = table_open(AttributeRelationId, ShareRowExclusiveLock);
+  HeapTuple atttup = SearchSysCacheCopy2(ATTNUM, ObjectIdGetDatum(holder_relid),
+                                         Int16GetDatum(1));
+  if (!HeapTupleIsValid(atttup)) {
+    table_close(attrel, NoLock);
+    return InvalidOid;
+  }
+
+  Form_pg_attribute attform = (Form_pg_attribute)GETSTRUCT(atttup);
+  if (strncmp(NameStr(attform->attname), desired_name, NAMEDATALEN - 1) == 0 &&
+      attform->atttypid == col->type_oid &&
+      attform->atttypmod == col->typmod &&
+      attform->attcollation == desired_coll &&
+      attform->attndims == desired_ndims) {
+    heap_freetuple(atttup);
+    table_close(attrel, NoLock);
+    return holder_type_oid;
+  }
+
+  namestrcpy(&attform->attname, desired_name);
+  attform->atttypid = col->type_oid;
+  attform->attlen = typlen;
+  attform->attbyval = typbyval;
+  attform->attalign = typalign;
+  attform->attstorage = typstorage;
+#if PG_VERSION_NUM >= 140000
+  attform->attcompression = '\0';
+#endif
+  attform->atttypmod = col->typmod;
+  attform->attndims = desired_ndims;
+  attform->attcollation = desired_coll;
+
+  CatalogTupleUpdate(attrel, &atttup->t_self, atttup);
+  heap_freetuple(atttup);
+  table_close(attrel, NoLock);
+
+  pljs_in_internal_catalog_update = true;
+  CacheInvalidateRelcacheByRelid(holder_relid);
+  pljs_in_internal_catalog_update = false;
+  CommandCounterIncrement();
+
+  return holder_type_oid;
+}
+
+static bool pljs_is_single_col_holder_type(Oid typid) {
+  if (!OidIsValid(typid) || typid == RECORDOID) {
+    return false;
+  }
+
+  HeapTuple typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+  if (!HeapTupleIsValid(typtup)) {
+    return false;
+  }
+  Form_pg_type tform = (Form_pg_type)GETSTRUCT(typtup);
+  bool match =
+      (strcmp(NameStr(tform->typname), "pljs_single_col_holder") == 0 ||
+       strcmp(NameStr(tform->typname), "plv8_single_col_holder") == 0 ||
+       strcmp(NameStr(tform->typname), "plpgq_single_col_holder") == 0);
+  ReleaseSysCache(typtup);
+  return match;
+}
+
+static void pljs_record_stamped_oid(Oid funcid) {
+  if (!OidIsValid(funcid)) {
+    return;
+  }
+  for (int i = 0; i < pljs_num_stamped_oids; i++) {
+    if (pljs_stamped_oids[i] == funcid) {
+      return;
+    }
+  }
+  if (pljs_num_stamped_oids < PLJS_MAX_STAMPED_OIDS) {
+    pljs_stamped_oids[pljs_num_stamped_oids++] = funcid;
+  }
+}
+
+static bool pljs_varlena_attr_equals(HeapTuple tup, TupleDesc tupdesc,
+                                     int attnum, bool new_isnull,
+                                     Datum new_val) {
+  bool old_isnull = false;
+  Datum old_val = heap_getattr(tup, attnum, tupdesc, &old_isnull);
+  if (old_isnull != new_isnull) {
+    return false;
+  }
+  if (new_isnull) {
+    return true;
+  }
+  struct varlena *old_v = PG_DETOAST_DATUM_PACKED(old_val);
+  struct varlena *new_v = PG_DETOAST_DATUM_PACKED(new_val);
+  size_t old_len = VARSIZE_ANY_EXHDR(old_v);
+  size_t new_len = VARSIZE_ANY_EXHDR(new_v);
+  bool eq = (old_len == new_len &&
+             memcmp(VARDATA_ANY(old_v), VARDATA_ANY(new_v), old_len) == 0);
+  if ((Pointer)old_v != DatumGetPointer(old_val)) {
+    pfree(old_v);
+  }
+  if ((Pointer)new_v != DatumGetPointer(new_val)) {
+    pfree(new_v);
+  }
+  return eq;
+}
+
+void pljs_ensure_proc_support(Oid fn_oid) {
+  if (!OidIsValid(fn_oid) || XactReadOnly) {
+    return;
+  }
+
+  Oid support_oid = pljs_lookup_func_oid_by_name_nargs("pljs_call_support", 1);
+  if (!OidIsValid(support_oid)) {
+    support_oid = pljs_lookup_func_oid_by_name_nargs("plv8_call_support", 1);
+  }
+  if (!OidIsValid(support_oid)) {
+    return;
+  }
+
+  HeapTuple check_tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+  if (!HeapTupleIsValid(check_tup)) {
+    return;
+  }
+  Form_pg_proc check_form = (Form_pg_proc)GETSTRUCT(check_tup);
+  bool needs_update =
+      (check_form->proretset && !OidIsValid(check_form->prosupport));
+  ReleaseSysCache(check_tup);
+
+  if (!needs_update) {
+    return;
+  }
+
+  Relation proc_rel = table_open(ProcedureRelationId, ShareRowExclusiveLock);
+  HeapTuple tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(fn_oid));
+  if (!HeapTupleIsValid(tup)) {
+    table_close(proc_rel, NoLock);
+    return;
+  }
+  Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(tup);
+  if (!procform->proretset || OidIsValid(procform->prosupport)) {
+    heap_freetuple(tup);
+    table_close(proc_rel, NoLock);
+    return;
+  }
+
+  TupleDesc proc_tupdesc = RelationGetDescr(proc_rel);
+  Datum values[Natts_pg_proc];
+  bool nulls[Natts_pg_proc];
+  bool replaces[Natts_pg_proc];
+  MemSet(values, 0, sizeof(values));
+  MemSet(nulls, false, sizeof(nulls));
+  MemSet(replaces, false, sizeof(replaces));
+
+  values[Anum_pg_proc_prosupport - 1] = ObjectIdGetDatum(support_oid);
+  replaces[Anum_pg_proc_prosupport - 1] = true;
+
+  HeapTuple newtup =
+      heap_modify_tuple(tup, proc_tupdesc, values, nulls, replaces);
+  CatalogTupleUpdate(proc_rel, &newtup->t_self, newtup);
+  pljs_cache_function_update_tuple_id(fn_oid, newtup);
+  heap_freetuple(newtup);
+  heap_freetuple(tup);
+  table_close(proc_rel, NoLock);
+
+  CommandCounterIncrement();
+}
+
+static void pljs_update_proc_table_columns(Oid funcid, int num_out_cols,
+                                           const pljs_inferred_col *out_cols,
+                                           const char *new_prosrc,
+                                           int new_num_in_args,
+                                           const Oid *new_in_arg_oids,
+                                           Oid target_rettype) {
+  if (!OidIsValid(funcid) || XactReadOnly) {
+    return;
+  }
+
+  Relation proc_rel = table_open(ProcedureRelationId, ShareRowExclusiveLock);
+
+  Oid single_holder_oid = InvalidOid;
+  if (num_out_cols == 1 && out_cols != NULL && new_prosrc == NULL &&
+      (!OidIsValid(target_rettype) ||
+       pljs_is_single_col_holder_type(target_rettype))) {
+    single_holder_oid = pljs_update_single_col_holder_type(&out_cols[0]);
+  }
+
+  HeapTuple tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(funcid));
+  if (!HeapTupleIsValid(tup)) {
+    table_close(proc_rel, NoLock);
+    return;
+  }
+
+  Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(tup);
+  TupleDesc proc_tupdesc = RelationGetDescr(proc_rel);
+
+  if (num_out_cols <= 0 && new_prosrc == NULL && new_num_in_args < 0 &&
+      procform->prorettype == RECORDOID &&
+      heap_attisnull(tup, Anum_pg_proc_proallargtypes, proc_tupdesc)) {
+    heap_freetuple(tup);
+    table_close(proc_rel, NoLock);
+    return;
+  }
+
+  Datum values[Natts_pg_proc];
+  bool nulls[Natts_pg_proc];
+  bool replaces[Natts_pg_proc];
+  MemSet(values, 0, sizeof(values));
+  MemSet(nulls, false, sizeof(nulls));
+  MemSet(replaces, false, sizeof(replaces));
+
+  int ninargs;
+  const Oid *inargoids;
+
+  if (new_num_in_args >= 0) {
+    ninargs = new_num_in_args;
+    inargoids = new_in_arg_oids;
+    values[Anum_pg_proc_pronargs - 1] = Int16GetDatum((int16)ninargs);
+    replaces[Anum_pg_proc_pronargs - 1] = true;
+    values[Anum_pg_proc_proargtypes - 1] =
+        PointerGetDatum(buildoidvector(inargoids, ninargs));
+    replaces[Anum_pg_proc_proargtypes - 1] = true;
+  } else {
+    ninargs = procform->pronargs;
+    inargoids = procform->proargtypes.values;
+  }
+
+  if (new_prosrc != NULL) {
+    values[Anum_pg_proc_prosrc - 1] = CStringGetTextDatum(new_prosrc);
+    replaces[Anum_pg_proc_prosrc - 1] = true;
+  }
+
+  Datum *existing_names = NULL;
+  bool *existing_nulls = NULL;
+  int n_existing_names = 0;
+  if (new_num_in_args < 0 && ninargs > 0) {
+    bool argnames_isnull = true;
+    Datum argnames_datum = heap_getattr(tup, Anum_pg_proc_proargnames,
+                                        proc_tupdesc,
+                                        &argnames_isnull);
+    if (!argnames_isnull) {
+#if PG_VERSION_NUM >= 160000
+      deconstruct_array_builtin(DatumGetArrayTypeP(argnames_datum), TEXTOID,
+                                &existing_names, &existing_nulls,
+                                &n_existing_names);
+#else
+      deconstruct_array(DatumGetArrayTypeP(argnames_datum), TEXTOID, -1, false,
+                        TYPALIGN_INT, &existing_names, &existing_nulls,
+                        &n_existing_names);
+#endif
+    }
+  }
+
+  bool has_real_in_argnames = false;
+  if (existing_names != NULL && n_existing_names >= ninargs && ninargs > 0) {
+    for (int i = 0; i < ninargs; i++) {
+      if (!existing_nulls[i]) {
+        char *nm = TextDatumGetCString(existing_names[i]);
+        if (nm[0] != '\0' && strncmp(nm, "__in_", 5) != 0) {
+          has_real_in_argnames = true;
+        }
+        pfree(nm);
+        if (has_real_in_argnames) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (num_out_cols <= 0) {
+    Oid desired_rettype =
+        OidIsValid(target_rettype) ? target_rettype : RECORDOID;
+    values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(desired_rettype);
+    replaces[Anum_pg_proc_prorettype - 1] = true;
+
+    nulls[Anum_pg_proc_proallargtypes - 1] = true;
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    nulls[Anum_pg_proc_proargmodes - 1] = true;
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    if (has_real_in_argnames) {
+#if PG_VERSION_NUM >= 160000
+      values[Anum_pg_proc_proargnames - 1] = PointerGetDatum(
+          construct_array_builtin(existing_names, ninargs, TEXTOID));
+#else
+      values[Anum_pg_proc_proargnames - 1] =
+          PointerGetDatum(construct_array(existing_names, ninargs, TEXTOID, -1,
+                                          false, TYPALIGN_INT));
+#endif
+    } else {
+      nulls[Anum_pg_proc_proargnames - 1] = true;
+    }
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+  } else if (num_out_cols == 1 && OidIsValid(single_holder_oid) &&
+             new_prosrc == NULL &&
+             (!OidIsValid(target_rettype) ||
+              pljs_is_single_col_holder_type(target_rettype))) {
+    values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(single_holder_oid);
+    replaces[Anum_pg_proc_prorettype - 1] = true;
+
+    nulls[Anum_pg_proc_proallargtypes - 1] = true;
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    nulls[Anum_pg_proc_proargmodes - 1] = true;
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    if (has_real_in_argnames) {
+#if PG_VERSION_NUM >= 160000
+      values[Anum_pg_proc_proargnames - 1] = PointerGetDatum(
+          construct_array_builtin(existing_names, ninargs, TEXTOID));
+#else
+      values[Anum_pg_proc_proargnames - 1] =
+          PointerGetDatum(construct_array(existing_names, ninargs, TEXTOID, -1,
+                                          false, TYPALIGN_INT));
+#endif
+    } else {
+      nulls[Anum_pg_proc_proargnames - 1] = true;
+    }
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+  } else if (num_out_cols == 1 &&
+             (new_prosrc != NULL ||
+              (OidIsValid(target_rettype) && target_rettype != RECORDOID))) {
+    int total_args = ninargs + 1;
+    Datum *all_types = (Datum *)palloc(sizeof(Datum) * total_args);
+    Datum *all_modes = (Datum *)palloc(sizeof(Datum) * total_args);
+    Datum *all_names = (Datum *)palloc(sizeof(Datum) * total_args);
+    Oid desired_rettype =
+        (OidIsValid(target_rettype) && target_rettype != RECORDOID &&
+         !pljs_is_single_col_holder_type(target_rettype))
+            ? target_rettype
+            : out_cols[0].type_oid;
+
+    values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(desired_rettype);
+    replaces[Anum_pg_proc_prorettype - 1] = true;
+
+    for (int i = 0; i < ninargs; i++) {
+      char argbuf[32];
+
+      CHECK_FOR_INTERRUPTS();
+      all_types[i] = ObjectIdGetDatum(inargoids[i]);
+      all_modes[i] = CharGetDatum(PROARGMODE_IN);
+      if (existing_names != NULL && i < n_existing_names &&
+          !existing_nulls[i]) {
+        all_names[i] = existing_names[i];
+      } else {
+        snprintf(argbuf, sizeof(argbuf), "__in_%d", i + 1);
+        all_names[i] = CStringGetTextDatum(argbuf);
+      }
+    }
+    all_types[ninargs] = ObjectIdGetDatum(out_cols[0].type_oid);
+    all_modes[ninargs] = CharGetDatum(PROARGMODE_TABLE);
+    all_names[ninargs] = CStringGetTextDatum(
+        out_cols[0].name[0] ? out_cols[0].name : "?column?");
+
+#if PG_VERSION_NUM >= 160000
+    values[Anum_pg_proc_proallargtypes - 1] = PointerGetDatum(
+        construct_array_builtin(all_types, total_args, OIDOID));
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    values[Anum_pg_proc_proargmodes - 1] = PointerGetDatum(
+        construct_array_builtin(all_modes, total_args, CHAROID));
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    values[Anum_pg_proc_proargnames - 1] = PointerGetDatum(
+        construct_array_builtin(all_names, total_args, TEXTOID));
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+#else
+    values[Anum_pg_proc_proallargtypes - 1] =
+        PointerGetDatum(construct_array(all_types, total_args, OIDOID,
+                                        sizeof(Oid), true, TYPALIGN_INT));
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    values[Anum_pg_proc_proargmodes - 1] =
+        PointerGetDatum(construct_array(all_modes, total_args, CHAROID, 1,
+                                        true, TYPALIGN_CHAR));
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    values[Anum_pg_proc_proargnames - 1] =
+        PointerGetDatum(construct_array(all_names, total_args, TEXTOID, -1,
+                                        false, TYPALIGN_INT));
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+#endif
+  } else {
+    int total_args = ninargs + num_out_cols;
+    Datum *all_types = (Datum *)palloc(sizeof(Datum) * total_args);
+    Datum *all_modes = (Datum *)palloc(sizeof(Datum) * total_args);
+    Datum *all_names = (Datum *)palloc(sizeof(Datum) * total_args);
+
+    Oid desired_rettype =
+        (OidIsValid(target_rettype) &&
+         !pljs_is_single_col_holder_type(target_rettype))
+            ? target_rettype
+            : RECORDOID;
+    values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(desired_rettype);
+    replaces[Anum_pg_proc_prorettype - 1] = true;
+
+    for (int i = 0; i < ninargs; i++) {
+      char argbuf[32];
+
+      CHECK_FOR_INTERRUPTS();
+      all_types[i] = ObjectIdGetDatum(inargoids[i]);
+      all_modes[i] = CharGetDatum(PROARGMODE_IN);
+      if (existing_names != NULL && i < n_existing_names &&
+          !existing_nulls[i]) {
+        all_names[i] = existing_names[i];
+      } else {
+        snprintf(argbuf, sizeof(argbuf), "__in_%d", i + 1);
+        all_names[i] = CStringGetTextDatum(argbuf);
+      }
+    }
+    for (int i = 0; i < num_out_cols; i++) {
+      CHECK_FOR_INTERRUPTS();
+      all_types[ninargs + i] = ObjectIdGetDatum(out_cols[i].type_oid);
+      all_modes[ninargs + i] = CharGetDatum(PROARGMODE_TABLE);
+      all_names[ninargs + i] = CStringGetTextDatum(
+          out_cols[i].name[0] ? out_cols[i].name : "?column?");
+    }
+
+#if PG_VERSION_NUM >= 160000
+    values[Anum_pg_proc_proallargtypes - 1] = PointerGetDatum(
+        construct_array_builtin(all_types, total_args, OIDOID));
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    values[Anum_pg_proc_proargmodes - 1] = PointerGetDatum(
+        construct_array_builtin(all_modes, total_args, CHAROID));
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    values[Anum_pg_proc_proargnames - 1] = PointerGetDatum(
+        construct_array_builtin(all_names, total_args, TEXTOID));
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+#else
+    values[Anum_pg_proc_proallargtypes - 1] =
+        PointerGetDatum(construct_array(all_types, total_args, OIDOID,
+                                        sizeof(Oid), true, TYPALIGN_INT));
+    replaces[Anum_pg_proc_proallargtypes - 1] = true;
+
+    values[Anum_pg_proc_proargmodes - 1] =
+        PointerGetDatum(construct_array(all_modes, total_args, CHAROID, 1,
+                                        true, TYPALIGN_CHAR));
+    replaces[Anum_pg_proc_proargmodes - 1] = true;
+
+    values[Anum_pg_proc_proargnames - 1] =
+        PointerGetDatum(construct_array(all_names, total_args, TEXTOID, -1,
+                                        false, TYPALIGN_INT));
+    replaces[Anum_pg_proc_proargnames - 1] = true;
+#endif
+  }
+
+  bool already_matches = true;
+  if (replaces[Anum_pg_proc_pronargs - 1]) {
+    if (procform->pronargs != (int16)ninargs ||
+        (ninargs > 0 &&
+         memcmp(procform->proargtypes.values, inargoids,
+                sizeof(Oid) * ninargs) != 0)) {
+      already_matches = false;
+    }
+  }
+  if (already_matches && replaces[Anum_pg_proc_prorettype - 1]) {
+    if (procform->prorettype !=
+        DatumGetObjectId(values[Anum_pg_proc_prorettype - 1])) {
+      already_matches = false;
+    }
+  }
+  if (already_matches && replaces[Anum_pg_proc_prosrc - 1]) {
+    if (!pljs_varlena_attr_equals(tup, proc_tupdesc, Anum_pg_proc_prosrc,
+                                  nulls[Anum_pg_proc_prosrc - 1],
+                                  values[Anum_pg_proc_prosrc - 1])) {
+      already_matches = false;
+    }
+  }
+  if (already_matches && replaces[Anum_pg_proc_proallargtypes - 1]) {
+    if (!pljs_varlena_attr_equals(tup, proc_tupdesc,
+                                  Anum_pg_proc_proallargtypes,
+                                  nulls[Anum_pg_proc_proallargtypes - 1],
+                                  values[Anum_pg_proc_proallargtypes - 1])) {
+      already_matches = false;
+    }
+  }
+  if (already_matches && replaces[Anum_pg_proc_proargmodes - 1]) {
+    if (!pljs_varlena_attr_equals(tup, proc_tupdesc, Anum_pg_proc_proargmodes,
+                                  nulls[Anum_pg_proc_proargmodes - 1],
+                                  values[Anum_pg_proc_proargmodes - 1])) {
+      already_matches = false;
+    }
+  }
+  if (already_matches && replaces[Anum_pg_proc_proargnames - 1]) {
+    if (!pljs_varlena_attr_equals(tup, proc_tupdesc, Anum_pg_proc_proargnames,
+                                  nulls[Anum_pg_proc_proargnames - 1],
+                                  values[Anum_pg_proc_proargnames - 1])) {
+      already_matches = false;
+    }
+  }
+
+  if (already_matches) {
+    heap_freetuple(tup);
+    table_close(proc_rel, NoLock);
+    if (num_out_cols > 0 && new_prosrc == NULL) {
+      pljs_record_stamped_oid(funcid);
+    }
+    return;
+  }
+
+  HeapTuple newtup = heap_modify_tuple(tup, proc_tupdesc, values,
+                                       nulls, replaces);
+  CatalogTupleUpdate(proc_rel, &newtup->t_self, newtup);
+
+  if (new_prosrc == NULL && new_num_in_args < 0) {
+    pljs_cache_function_update_tuple_id(funcid, newtup);
+  }
+
+  heap_freetuple(newtup);
+  heap_freetuple(tup);
+  table_close(proc_rel, NoLock);
+
+  CommandCounterIncrement();
+
+  if (num_out_cols > 0 && new_prosrc == NULL) {
+    pljs_record_stamped_oid(funcid);
+  }
+}
+
+static int pljs_update_func_overloads_columns(const char *func_name,
+                                              int num_out_cols,
+                                              const pljs_inferred_col *out_cols) {
+  if (XactReadOnly) {
+    return 0;
+  }
+
+  char norm[NAMEDATALEN];
+  pljs_normalize_func_name(func_name ? func_name : "graph_table", norm,
+                           sizeof(norm));
+  if (norm[0] == '\0') {
+    strlcpy(norm, "graph_table", sizeof(norm));
+  }
+
+  List *oids = NIL;
+  CatCList *catlist =
+      SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(norm));
+  for (int i = 0; i < catlist->n_members; i++) {
+    HeapTuple proctup = &catlist->members[i]->tuple;
+    Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(proctup);
+
+    CHECK_FOR_INTERRUPTS();
+    if (procform->proretset &&
+        (procform->prorettype == RECORDOID ||
+         pljs_is_single_col_holder_type(procform->prorettype))) {
+      if (num_out_cols <= 0 && procform->prorettype == RECORDOID) {
+        bool att_isnull = true;
+        (void)SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proallargtypes,
+                              &att_isnull);
+        if (att_isnull) {
+          continue;
+        }
+      }
+      oids = lappend_oid(oids, procform->oid);
+    }
+  }
+  ReleaseSysCacheList(catlist);
+
+  int count = 0;
+  ListCell *lc;
+  foreach (lc, oids) {
+    Oid foid = lfirst_oid(lc);
+
+    CHECK_FOR_INTERRUPTS();
+    pljs_update_proc_table_columns(foid, num_out_cols, out_cols, NULL, -1,
+                                   NULL, InvalidOid);
+    if (num_out_cols > 0) {
+      pljs_ensure_proc_support(foid);
+    }
+    count++;
+  }
+  list_free(oids);
+  return count;
+}
+
+static void pljs_reset_all_stamped_procs(void) {
+  if (pljs_in_support_internal_call || pljs_num_stamped_oids <= 0 ||
+      XactReadOnly) {
+    return;
+  }
+
+  int count = pljs_num_stamped_oids;
+  Oid local_oids[PLJS_MAX_STAMPED_OIDS];
+  for (int i = 0; i < count; i++) {
+    local_oids[i] = pljs_stamped_oids[i];
+  }
+  pljs_num_stamped_oids = 0;
+
+  MemoryContext saved_cxt = CurrentMemoryContext;
+  PG_TRY();
+  {
+    for (int i = 0; i < count; i++) {
+      CHECK_FOR_INTERRUPTS();
+      pljs_update_proc_table_columns(local_oids[i], 0, NULL, NULL, -1, NULL,
+                                     InvalidOid);
+    }
+  }
+  PG_CATCH();
+  {
+    FlushErrorState();
+    MemoryContextSwitchTo(saved_cxt);
+  }
+  PG_END_TRY();
+}
+
+int pljs_set_func_columns(const char *func_name, int ncols,
+                          const pljs_inferred_col *cols) {
+  return pljs_update_func_overloads_columns(func_name, ncols, cols);
+}
+
+static bool pljs_match_sql_literal_at(const char *p, const char *source_str,
+                                      size_t src_len,
+                                      const char **lit_end_out) {
+  if (*p == '\'') {
+    const char *q = p + 1;
+    const char *s = source_str;
+
+    while (*s != '\0') {
+      if (*s == '\'') {
+        if (q[0] == '\'' && q[1] == '\'') {
+          q += 2;
+          s++;
+        } else if (q[0] == '\\' && q[1] == '\'') {
+          q += 2;
+          s++;
+        } else {
+          return false;
+        }
+      } else if (*q == *s) {
+        q++;
+        s++;
+      } else {
+        return false;
+      }
+    }
+
+    if (*q == '\'' && q[1] != '\'') {
+      *lit_end_out = q + 1;
+      return true;
+    }
+    return false;
+  }
+
+  if (*p == '$') {
+    const char *t = p + 1;
+    while (isalnum((unsigned char)*t) || *t == '_') {
+      t++;
+    }
+    if (*t == '$') {
+      size_t tag_len = (size_t)(t - p) + 1;
+      const char *body = t + 1;
+      if (strncmp(body, source_str, src_len) == 0 &&
+          strncmp(body + src_len, p, tag_len) == 0) {
+        *lit_end_out = body + src_len + tag_len;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool pljs_find_source_literal_from(const char *query_ctx,
+                                          size_t start_offset,
+                                          const char *source_str,
+                                          size_t src_len,
+                                          const char **quote_start_out,
+                                          const char **lit_end_out) {
+  const char *p = query_ctx + start_offset;
+
+  while (*p != '\0') {
+    CHECK_FOR_INTERRUPTS();
+
+    if (p[0] == '-' && p[1] == '-') {
+      p += 2;
+      while (*p != '\0' && *p != '\n') {
+        p++;
+      }
+      continue;
+    }
+
+    if (p[0] == '/' && p[1] == '*') {
+      p += 2;
+      while (*p != '\0' && !(p[0] == '*' && p[1] == '/')) {
+        p++;
+      }
+      if (*p != '\0') {
+        p += 2;
+      }
+      continue;
+    }
+
+    if (*p == '"') {
+      p++;
+      while (*p != '\0') {
+        if (*p == '"') {
+          if (p[1] == '"') {
+            p += 2;
+          } else {
+            p++;
+            break;
+          }
+        } else {
+          p++;
+        }
+      }
+      continue;
+    }
+
+    if (*p == '\'') {
+      const char *lit_end = NULL;
+      if (pljs_match_sql_literal_at(p, source_str, src_len, &lit_end)) {
+        const char *qstart = p;
+        if (qstart > query_ctx && (qstart[-1] == 'E' || qstart[-1] == 'e') &&
+            (qstart - 1 == query_ctx ||
+             (!isalnum((unsigned char)qstart[-2]) && qstart[-2] != '_'))) {
+          qstart--;
+        }
+        *quote_start_out = qstart;
+        *lit_end_out = lit_end;
+        return true;
+      }
+
+      p++;
+      while (*p != '\0') {
+        if (*p == '\'' && p[1] == '\'') {
+          p += 2;
+        } else if (*p == '\\' && p[1] != '\0') {
+          p += 2;
+        } else if (*p == '\'') {
+          p++;
+          break;
+        } else {
+          p++;
+        }
+      }
+      continue;
+    }
+
+    if (*p == '$') {
+      const char *t = p + 1;
+      while (isalnum((unsigned char)*t) || *t == '_') {
+        t++;
+      }
+      if (*t == '$') {
+        const char *lit_end = NULL;
+        if (pljs_match_sql_literal_at(p, source_str, src_len, &lit_end)) {
+          *quote_start_out = p;
+          *lit_end_out = lit_end;
+          return true;
+        }
+
+        size_t tag_len = (size_t)(t - p) + 1;
+        const char *scan = t + 1;
+        while (*scan != '\0') {
+          if (*scan == '$' && strncmp(scan, p, tag_len) == 0) {
+            scan += tag_len;
+            break;
+          }
+          scan++;
+        }
+        p = scan;
+        continue;
+      }
+    }
+
+    p++;
+  }
+
+  return false;
+}
+
+static bool pljs_is_non_coldef_keyword(const char *tok_start, size_t tok_len) {
+  static const char *const kw[] = {
+      "AS",          "WHERE",   "JOIN",      "ON",        "USING",
+      "ORDER",       "GROUP",   "HAVING",    "LIMIT",     "OFFSET",
+      "FETCH",       "FOR",     "WINDOW",    "CROSS",     "LEFT",
+      "RIGHT",       "FULL",    "INNER",     "OUTER",     "NATURAL",
+      "LATERAL",     "UNION",   "INTERSECT", "EXCEPT",    "TABLESAMPLE",
+      "RETURNING",   "INTO",    "VALUES",    "SELECT",    "FROM",
+      NULL};
+  for (int i = 0; kw[i] != NULL; i++) {
+    if (strlen(kw[i]) == tok_len &&
+        pg_strncasecmp(tok_start, kw[i], tok_len) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void pljs_extract_enclosing_call(const char *query_ctx,
+                                        const char *source_str,
+                                        char **func_name_out,
+                                        char **first_arg_out,
+                                        bool *has_coldeflist_out) {
+  static const char *last_query_ctx = NULL;
+  static size_t last_search_offset = 0;
+
+  *func_name_out = pstrdup("graph_table");
+  *first_arg_out = pstrdup("");
+  *has_coldeflist_out = false;
+
+  if (query_ctx == NULL || *query_ctx == '\0' || source_str == NULL ||
+      *source_str == '\0') {
+    return;
+  }
+
+  size_t query_len = strlen(query_ctx);
+  size_t src_len = strlen(source_str);
+  if (query_ctx != last_query_ctx || last_search_offset >= query_len) {
+    last_query_ctx = query_ctx;
+    last_search_offset = 0;
+  }
+
+  const char *quote_start = NULL;
+  const char *lit_end = NULL;
+  if (!pljs_find_source_literal_from(query_ctx, last_search_offset, source_str,
+                                     src_len, &quote_start, &lit_end)) {
+    if (last_search_offset == 0 ||
+        !pljs_find_source_literal_from(query_ctx, 0, source_str, src_len,
+                                       &quote_start, &lit_end)) {
+      return;
+    }
+  }
+
+  last_search_offset = (size_t)(lit_end - query_ctx);
+
+  int depth = 0;
+  bool in_squote_back = false;
+  bool in_dquote_back = false;
+  const char *open_paren = NULL;
+  const char *first_comma_at_zero = NULL;
+
+  for (const char *p = quote_start - 1; p >= query_ctx; p--) {
+    char c = *p;
+    CHECK_FOR_INTERRUPTS();
+    if (in_squote_back) {
+      if (c == '\'') {
+        if (p > query_ctx && p[-1] == '\'') {
+          p--;
+        } else {
+          in_squote_back = false;
+        }
+      }
+      continue;
+    }
+    if (in_dquote_back) {
+      if (c == '"') {
+        if (p > query_ctx && p[-1] == '"') {
+          p--;
+        } else {
+          in_dquote_back = false;
+        }
+      }
+      continue;
+    }
+    if (c == '\'') {
+      in_squote_back = true;
+      continue;
+    }
+    if (c == '"') {
+      in_dquote_back = true;
+      continue;
+    }
+    if (c == ')') {
+      depth++;
+    } else if (c == '(') {
+      if (depth == 0) {
+        open_paren = p;
+        break;
+      }
+      depth--;
+    } else if (c == ',' && depth == 0) {
+      first_comma_at_zero = p;
+    }
+  }
+
+  if (open_paren != NULL) {
+    const char *fn_end = open_paren;
+    while (fn_end > query_ctx && isspace((unsigned char)fn_end[-1])) {
+      fn_end--;
+    }
+    const char *fn_start = fn_end;
+    while (fn_start > query_ctx &&
+           (isalnum((unsigned char)fn_start[-1]) || fn_start[-1] == '_' ||
+            fn_start[-1] == '.' || fn_start[-1] == '"')) {
+      fn_start--;
+    }
+    if (fn_end > fn_start) {
+      char *raw_fn = pnstrdup(fn_start, fn_end - fn_start);
+      char norm[NAMEDATALEN];
+      pljs_normalize_func_name(raw_fn, norm, sizeof(norm));
+      pfree(raw_fn);
+      if (norm[0] != '\0') {
+        pfree(*func_name_out);
+        *func_name_out = pstrdup(norm);
+      }
+    }
+
+    if (first_comma_at_zero != NULL && first_comma_at_zero > open_paren + 1) {
+      const char *a_start = open_paren + 1;
+      const char *a_end = first_comma_at_zero;
+      while (a_start < a_end && isspace((unsigned char)*a_start)) {
+        a_start++;
+      }
+      while (a_end > a_start && isspace((unsigned char)a_end[-1])) {
+        a_end--;
+      }
+      pfree(*first_arg_out);
+      *first_arg_out = pnstrdup(a_start, a_end - a_start);
+    }
+
+    int fdepth = 1;
+    bool in_squote = false;
+    const char *close_paren = NULL;
+    for (const char *p = lit_end; *p != '\0'; p++) {
+      char c = *p;
+      CHECK_FOR_INTERRUPTS();
+      if (in_squote) {
+        if (c == '\'') {
+          if (p[1] == '\'') {
+            p++;
+          } else {
+            in_squote = false;
+          }
+        }
+        continue;
+      }
+      if (c == '\'') {
+        in_squote = true;
+        continue;
+      }
+      if (c == '(') {
+        fdepth++;
+      } else if (c == ')') {
+        fdepth--;
+        if (fdepth == 0) {
+          close_paren = p;
+          break;
+        }
+      }
+    }
+
+    if (close_paren != NULL) {
+      const char *after = close_paren + 1;
+      bool saw_as = false;
+      while (*after != '\0' && isspace((unsigned char)*after)) {
+        after++;
+      }
+
+      if (pg_strncasecmp(after, "AS", 2) == 0 &&
+          (isspace((unsigned char)after[2]) || after[2] == '(')) {
+        saw_as = true;
+        after += 2;
+        while (*after != '\0' && isspace((unsigned char)*after)) {
+          after++;
+        }
+        if (*after == '(') {
+          *has_coldeflist_out = true;
+          return;
+        }
+      }
+
+      if (isalpha((unsigned char)*after) || *after == '_' || *after == '"') {
+        const char *tok_start = after;
+        if (*after == '"') {
+          after++;
+          while (*after != '\0' && *after != '"') {
+            after++;
+          }
+          if (*after == '"') {
+            after++;
+          }
+        } else {
+          while (isalnum((unsigned char)*after) || *after == '_') {
+            after++;
+          }
+        }
+        size_t tok_len = (size_t)(after - tok_start);
+        if (saw_as || !pljs_is_non_coldef_keyword(tok_start, tok_len)) {
+          while (*after != '\0' && isspace((unsigned char)*after)) {
+            after++;
+          }
+          if (*after == '(') {
+            *has_coldeflist_out = true;
+          }
+        }
+      }
+    }
+  }
+}
+
+static void pljs_parse_and_apply_inferred_tsv(const char *func_name,
+                                              const char *source_str,
+                                              const char *fallback_first_arg,
+                                              bool fallback_has_coldef,
+                                              const char *tsv) {
+  if (tsv == NULL || *tsv == '\0') {
+    return;
+  }
+
+  bool has_coldef = fallback_has_coldef;
+  char *first_arg = fallback_first_arg ? pstrdup(fallback_first_arg) : NULL;
+  char *copy = pstrdup(tsv);
+  char *saveptr = NULL;
+  pljs_inferred_col cols[FUNC_MAX_ARGS];
+  int ncols = 0;
+  int line_idx = 0;
+
+  for (char *line = strtok_r(copy, "\n", &saveptr); line != NULL;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    CHECK_FOR_INTERRUPTS();
+    if (line_idx == 0 && strncmp(line, "COLDEF\t", 7) == 0) {
+      if (strncmp(line, "COLDEF\t1", 8) == 0) {
+        has_coldef = true;
+      } else if (strncmp(line, "COLDEF\t0", 8) == 0) {
+        has_coldef = false;
+        if (line[8] == '\t' && line[9] != '\0') {
+          first_arg = pstrdup(line + 9);
+        }
+      }
+      line_idx++;
+      continue;
+    }
+    if (ncols < FUNC_MAX_ARGS) {
+      char *tab1 = strchr(line, '\t');
+      if (tab1 != NULL) {
+        *tab1 = '\0';
+        char *tab2 = strchr(tab1 + 1, '\t');
+        if (tab2 != NULL) {
+          *tab2 = '\0';
+          char *tab3 = strchr(tab2 + 1, '\t');
+          if (tab3 != NULL) {
+            *tab3 = '\0';
+          }
+          strlcpy(cols[ncols].name, line[0] ? line : "?column?", NAMEDATALEN);
+          cols[ncols].type_oid = (Oid)atooid(tab1 + 1);
+          cols[ncols].typmod = atoi(tab2 + 1);
+          cols[ncols].collation_oid =
+              tab3 ? (Oid)atooid(tab3 + 1) : InvalidOid;
+          ncols++;
+        }
+      }
+    }
+    line_idx++;
+  }
+
+  if (ncols > 0) {
+    pljs_save_inferred_columns(func_name, source_str, first_arg, ncols, cols);
+  }
+
+  if (has_coldef) {
+    pljs_update_func_overloads_columns(func_name, 0, NULL);
+  } else if (ncols > 0) {
+    pljs_update_func_overloads_columns(func_name, ncols, cols);
+  }
+}
+
+static int pljs_extract_cols_from_js_array(JSContext *ctx, JSValueConst arr,
+                                           pljs_inferred_col *out_cols) {
+  int32_t len = pljs_js_array_length(arr, ctx);
+  if (len <= 0) {
+    return 0;
+  }
+  if (len > FUNC_MAX_ARGS) {
+    len = FUNC_MAX_ARGS;
+  }
+  int ncols = 0;
+
+  for (int32_t i = 0; i < len; i++) {
+    CHECK_FOR_INTERRUPTS();
+    JSValue elem = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+    if (!JS_IsObject(elem) || JS_IsNull(elem)) {
+      JS_FreeValue(ctx, elem);
+      continue;
+    }
+
+    JSValue name_val = JS_GetPropertyStr(ctx, elem, "name");
+    const char *cname =
+        JS_IsString(name_val) ? JS_ToCString(ctx, name_val) : NULL;
+    strlcpy(out_cols[ncols].name,
+            (cname && cname[0]) ? cname : "?column?", NAMEDATALEN);
+    if (cname) {
+      JS_FreeCString(ctx, cname);
+    }
+    JS_FreeValue(ctx, name_val);
+
+    Oid type_oid = InvalidOid;
+    int32 typmod = -1;
+    volatile Oid coll_oid = InvalidOid;
+
+    JSValue oid_val = JS_GetPropertyStr(ctx, elem, "type_oid");
+    uint32_t oid_num = 0;
+    if (JS_IsNumber(oid_val) && JS_ToUint32(ctx, &oid_num, oid_val) == 0 &&
+        oid_num != 0) {
+      type_oid = (Oid)oid_num;
+    }
+    JS_FreeValue(ctx, oid_val);
+
+    JSValue tm_val = JS_GetPropertyStr(ctx, elem, "typmod");
+    int32_t tm_num = -1;
+    if (JS_IsNumber(tm_val) && JS_ToInt32(ctx, &tm_num, tm_val) == 0) {
+      typmod = tm_num;
+    }
+    JS_FreeValue(ctx, tm_val);
+
+    JSValue coll_val = JS_GetPropertyStr(ctx, elem, "collation_oid");
+    uint32_t coll_num = 0;
+    if (JS_IsNumber(coll_val) && JS_ToUint32(ctx, &coll_num, coll_val) == 0) {
+      coll_oid = (Oid)coll_num;
+    }
+    JS_FreeValue(ctx, coll_val);
+
+    if (!OidIsValid(type_oid)) {
+      JSValue tstr_val = JS_GetPropertyStr(ctx, elem, "type");
+      if (!JS_IsString(tstr_val)) {
+        JS_FreeValue(ctx, tstr_val);
+        tstr_val = JS_GetPropertyStr(ctx, elem, "type_sql");
+      }
+      if (!JS_IsString(tstr_val)) {
+        JS_FreeValue(ctx, tstr_val);
+        tstr_val = JS_GetPropertyStr(ctx, elem, "type_name");
+      }
+      if (JS_IsString(tstr_val)) {
+        const char *tstr = JS_ToCString(ctx, tstr_val);
+        if (tstr != NULL) {
+          MemoryContext saved_cxt = CurrentMemoryContext;
+          PG_TRY();
+          {
+#if PG_VERSION_NUM >= 160000
+            (void)parseTypeString(tstr, &type_oid, &typmod, NULL);
+#else
+            (void)parseTypeString(tstr, &type_oid, &typmod, false);
+#endif
+          }
+          PG_CATCH();
+          {
+            FlushErrorState();
+            MemoryContextSwitchTo(saved_cxt);
+            type_oid = TEXTOID;
+            typmod = -1;
+          }
+          PG_END_TRY();
+          JS_FreeCString(ctx, tstr);
+        }
+      }
+      JS_FreeValue(ctx, tstr_val);
+    }
+
+    JS_FreeValue(ctx, elem);
+
+    if (!OidIsValid(type_oid)) {
+      type_oid = TEXTOID;
+    }
+
+    out_cols[ncols].type_oid = type_oid;
+    out_cols[ncols].typmod = typmod;
+    out_cols[ncols].collation_oid = coll_oid;
+    ncols++;
+  }
+  return ncols;
+}
+
+Datum pljs_source_in(PG_FUNCTION_ARGS) {
+  char *str = PG_GETARG_CSTRING(0);
+  const char *volatile query_ctx = debug_query_string ? debug_query_string : "";
+
+  if (!pljs_in_support_internal_call && str != NULL && *str != '\0') {
+    char *func_name = NULL;
+    char *first_arg = NULL;
+    bool has_coldeflist = false;
+
+    pljs_extract_enclosing_call(query_ctx, str, &func_name, &first_arg,
+                                &has_coldeflist);
+
+    PljsSupportHookEntry *hook =
+        pljs_find_or_create_hook_entry(func_name, false);
+    if (hook != NULL && hook->infer_ctx != NULL &&
+        JS_IsFunction(hook->infer_ctx, hook->infer_js_cb)) {
+      char *inferred_tsv = NULL;
+      pljs_inferred_col inferred_cols[FUNC_MAX_ARGS];
+      int inferred_ncols = -1;
+
+      JSContext *ctx = hook->infer_ctx;
+      JSValue req = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, req, "func_name", JS_NewString(ctx, func_name));
+      JS_SetPropertyStr(ctx, req, "query_string", JS_NewString(ctx, query_ctx));
+      JS_SetPropertyStr(ctx, req, "source_arg", JS_NewString(ctx, str));
+      JS_SetPropertyStr(ctx, req, "first_arg",
+                        JS_NewString(ctx, first_arg ? first_arg : ""));
+      JS_SetPropertyStr(ctx, req, "has_coldeflist",
+                        JS_NewBool(ctx, has_coldeflist ? 1 : 0));
+
+      JSValue res = JS_UNDEFINED;
+      pljs_in_support_internal_call = true;
+      bool ok = pljs_hook_call(ctx, hook->infer_js_cb, 1, &req, true, &res,
+                               NULL);
+      pljs_in_support_internal_call = false;
+      JS_FreeValue(ctx, req);
+
+      if (ok) {
+        if (JS_IsString(res)) {
+          const char *tsv_cs = JS_ToCString(ctx, res);
+          if (tsv_cs != NULL) {
+            inferred_tsv = pstrdup(tsv_cs);
+            JS_FreeCString(ctx, tsv_cs);
+          }
+        } else if (JS_IsArray(ctx, res)) {
+          inferred_ncols =
+              pljs_extract_cols_from_js_array(ctx, res, inferred_cols);
+        } else if (JS_IsObject(res) && !JS_IsNull(res)) {
+          JSValue cd_val = JS_GetPropertyStr(ctx, res, "has_coldeflist");
+          if (JS_IsBool(cd_val)) {
+            has_coldeflist = JS_ToBool(ctx, cd_val) > 0;
+          }
+          JS_FreeValue(ctx, cd_val);
+
+          JSValue fa_val = JS_GetPropertyStr(ctx, res, "first_arg");
+          if (JS_IsString(fa_val)) {
+            const char *facs = JS_ToCString(ctx, fa_val);
+            if (facs != NULL) {
+              first_arg = pstrdup(facs);
+              JS_FreeCString(ctx, facs);
+            }
+          }
+          JS_FreeValue(ctx, fa_val);
+
+          JSValue cols_val = JS_GetPropertyStr(ctx, res, "columns");
+          if (JS_IsArray(ctx, cols_val)) {
+            inferred_ncols =
+                pljs_extract_cols_from_js_array(ctx, cols_val, inferred_cols);
+          }
+          JS_FreeValue(ctx, cols_val);
+        }
+        JS_FreeValue(ctx, res);
+      }
+
+      if (inferred_tsv != NULL) {
+        pljs_parse_and_apply_inferred_tsv(func_name, str, first_arg,
+                                          has_coldeflist, inferred_tsv);
+      } else if (inferred_ncols >= 0) {
+        if (inferred_ncols > 0) {
+          pljs_save_inferred_columns(func_name, str, first_arg, inferred_ncols,
+                                     inferred_cols);
+        }
+        if (has_coldeflist) {
+          pljs_update_func_overloads_columns(func_name, 0, NULL);
+        } else if (inferred_ncols > 0) {
+          pljs_update_func_overloads_columns(func_name, inferred_ncols,
+                                             inferred_cols);
+        }
+      }
+    } else {
+      volatile Oid infer_oid = pljs_find_infer_sql_func_oid(func_name);
+      if (OidIsValid(infer_oid)) {
+        char *volatile tsv = NULL;
+        pljs_in_support_internal_call = true;
+        PG_TRY();
+        {
+          Datum res_datum =
+              OidFunctionCall2(infer_oid, CStringGetTextDatum(query_ctx),
+                               CStringGetTextDatum(str));
+          tsv = TextDatumGetCString(res_datum);
+        }
+        PG_FINALLY();
+        {
+          pljs_in_support_internal_call = false;
+        }
+        PG_END_TRY();
+        if (tsv != NULL) {
+          pljs_parse_and_apply_inferred_tsv(func_name, str, first_arg,
+                                            has_coldeflist, tsv);
+        }
+      }
+    }
+  }
+
+  PG_RETURN_TEXT_P(cstring_to_text(str));
+}
+
+Datum pljs_source_out(PG_FUNCTION_ARGS) {
+  Datum txt = PG_GETARG_DATUM(0);
+  PG_RETURN_CSTRING(TextDatumGetCString(txt));
+}
+
+static char *pljs_extract_const_string(Node *node) {
+  if (node == NULL) {
+    return NULL;
+  }
+  while (IsA(node, RelabelType) || IsA(node, CoerceViaIO) ||
+         IsA(node, CoerceToDomain)) {
+    CHECK_FOR_INTERRUPTS();
+    if (IsA(node, RelabelType)) {
+      node = (Node *)((RelabelType *)node)->arg;
+    } else if (IsA(node, CoerceViaIO)) {
+      node = (Node *)((CoerceViaIO *)node)->arg;
+    } else {
+      node = (Node *)((CoerceToDomain *)node)->arg;
+    }
+  }
+  if (IsA(node, Const)) {
+    Const *c = (Const *)node;
+    Oid typoutput;
+    bool typIsVarlena;
+
+    if (c->constisnull) {
+      return NULL;
+    }
+    getTypeOutputInfo(c->consttype, &typoutput, &typIsVarlena);
+    return OidOutputFunctionCall(typoutput, c->constvalue);
+  }
+  return NULL;
+}
+
+static bool pljs_is_source_type_node(Node *node) {
+  if (node == NULL) {
+    return false;
+  }
+  Oid typid = getBaseType(exprType(node));
+  if (!OidIsValid(typid)) {
+    return false;
+  }
+  HeapTuple tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+  if (!HeapTupleIsValid(tp)) {
+    return false;
+  }
+  Form_pg_type tform = (Form_pg_type)GETSTRUCT(tp);
+  bool match = (strcmp(NameStr(tform->typname), "pljs_source") == 0 ||
+                strcmp(NameStr(tform->typname), "plv8_source") == 0 ||
+                strcmp(NameStr(tform->typname), "pgq_pattern") == 0);
+  ReleaseSysCache(tp);
+  return match;
+}
+
+static bool pljs_is_null_const_node(Node *node) {
+  while (node != NULL &&
+         (IsA(node, RelabelType) || IsA(node, CoerceViaIO) ||
+          IsA(node, CoerceToDomain))) {
+    CHECK_FOR_INTERRUPTS();
+    if (IsA(node, RelabelType)) {
+      node = (Node *)((RelabelType *)node)->arg;
+    } else if (IsA(node, CoerceViaIO)) {
+      node = (Node *)((CoerceViaIO *)node)->arg;
+    } else {
+      node = (Node *)((CoerceToDomain *)node)->arg;
+    }
+  }
+  return (node != NULL && IsA(node, Const) && ((Const *)node)->constisnull);
+}
+
+static char *pljs_extract_first_arg_string(Node *arg1) {
+  char *const_str = pljs_extract_const_string(arg1);
+  if (const_str != NULL) {
+    return const_str;
+  }
+
+  while (arg1 != NULL &&
+         (IsA(arg1, RelabelType) || IsA(arg1, CoerceViaIO) ||
+          IsA(arg1, CoerceToDomain))) {
+    CHECK_FOR_INTERRUPTS();
+    if (IsA(arg1, RelabelType)) {
+      arg1 = (Node *)((RelabelType *)arg1)->arg;
+    } else if (IsA(arg1, CoerceViaIO)) {
+      arg1 = (Node *)((CoerceViaIO *)arg1)->arg;
+    } else {
+      arg1 = (Node *)((CoerceToDomain *)arg1)->arg;
+    }
+  }
+
+  if (arg1 != NULL && IsA(arg1, FuncExpr)) {
+    FuncExpr *fe = (FuncExpr *)arg1;
+    char *funcname = get_func_name(fe->funcid);
+    Oid nspid = get_func_namespace(fe->funcid);
+    char *nspname = OidIsValid(nspid) ? get_namespace_name(nspid) : NULL;
+
+    if (funcname != NULL) {
+      if (nspname != NULL) {
+        return psprintf("%s.%s()", quote_identifier(nspname),
+                        quote_identifier(funcname));
+      }
+      return psprintf("%s()", quote_identifier(funcname));
+    }
+  }
+
+  return NULL;
+}
+
+static void pljs_append_json_string(StringInfo buf, const char *str) {
+  appendStringInfoChar(buf, '"');
+  if (str != NULL) {
+    for (const unsigned char *p = (const unsigned char *)str; *p != '\0'; p++) {
+      switch (*p) {
+      case '"':
+        appendStringInfoString(buf, "\\\"");
+        break;
+      case '\\':
+        appendStringInfoString(buf, "\\\\");
+        break;
+      case '\b':
+        appendStringInfoString(buf, "\\b");
+        break;
+      case '\f':
+        appendStringInfoString(buf, "\\f");
+        break;
+      case '\n':
+        appendStringInfoString(buf, "\\n");
+        break;
+      case '\r':
+        appendStringInfoString(buf, "\\r");
+        break;
+      case '\t':
+        appendStringInfoString(buf, "\\t");
+        break;
+      default:
+        if (*p < 0x20) {
+          appendStringInfo(buf, "\\u%04x", (int)*p);
+        } else {
+          appendStringInfoChar(buf, (char)*p);
+        }
+        break;
+      }
+    }
+  }
+  appendStringInfoChar(buf, '"');
+}
+
+static void pljs_append_rtable_to_lateral_json(StringInfo lat_buf, List *rtable,
+                                               RangeTblEntry *skip_rte,
+                                               int sublevels_up,
+                                               bool *first_rte) {
+  ListCell *lc;
+  volatile int rtindex = 0;
+
+  foreach (lc, rtable) {
+    RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+    List *colnames = NIL;
+    List *colvars = NIL;
+    ListCell *name_lc;
+    ListCell *var_lc;
+    volatile bool first_col = true;
+
+    CHECK_FOR_INTERRUPTS();
+    rtindex++;
+
+    if (rte == skip_rte || rte->eref == NULL || rte->eref->aliasname == NULL) {
+      continue;
+    }
+    if (rte->rtekind == RTE_SUBQUERY && rte->subquery == NULL) {
+      continue;
+    }
+    if (rte->rtekind == RTE_JOIN &&
+        (rte->joinaliasvars == NIL ||
+         list_length(rte->eref->colnames) != list_length(rte->joinaliasvars))) {
+      continue;
+    }
+    if (rte->rtekind == RTE_RESULT
+#if PG_VERSION_NUM >= 180000
+        || rte->rtekind == RTE_GROUP
+#endif
+    ) {
+      continue;
+    }
+
+    if (rte->rtekind == RTE_FUNCTION) {
+      bool can_expand = true;
+      ListCell *flc;
+
+      foreach (flc, rte->functions) {
+        RangeTblFunction *rtfunc = (RangeTblFunction *)lfirst(flc);
+        if (rtfunc->funccolnames == NIL) {
+          Oid funcrettype = InvalidOid;
+          TupleDesc tupdesc = NULL;
+          TypeFuncClass functypclass =
+              get_expr_result_type(rtfunc->funcexpr, &funcrettype, &tupdesc);
+
+          if (functypclass == TYPEFUNC_COMPOSITE ||
+              functypclass == TYPEFUNC_COMPOSITE_DOMAIN) {
+            if (tupdesc == NULL || rtfunc->funccolcount > tupdesc->natts) {
+              can_expand = false;
+              break;
+            }
+          } else if (functypclass == TYPEFUNC_RECORD) {
+            if (list_length(rtfunc->funccoltypes) != rtfunc->funccolcount) {
+              can_expand = false;
+              break;
+            }
+          } else if (functypclass != TYPEFUNC_SCALAR) {
+            can_expand = false;
+            break;
+          }
+        }
+      }
+
+      if (!can_expand) {
+        if (list_length(rte->functions) == 1) {
+          RangeTblFunction *rtfunc =
+              (RangeTblFunction *)linitial(rte->functions);
+          if (rtfunc->funcexpr != NULL && IsA(rtfunc->funcexpr, FuncExpr)) {
+            FuncExpr *fe = (FuncExpr *)rtfunc->funcexpr;
+            int fnargs = list_length(fe->args);
+            if (fnargs >= 1) {
+              bool src_first =
+                  (fnargs == 1 ||
+                   pljs_is_source_type_node((Node *)linitial(fe->args)));
+              Node *snode = src_first
+                                ? (Node *)linitial(fe->args)
+                                : (fnargs >= 2 ? (Node *)lsecond(fe->args)
+                                               : NULL);
+              char *rsrc = pljs_extract_const_string(snode);
+              PljsInferredEntry *inf = pljs_find_inferred_columns(rsrc);
+              if (inf != NULL &&
+                  inf->ncols == list_length(rte->eref->colnames)) {
+                ListCell *clc;
+                int cidx = 0;
+                foreach (clc, rte->eref->colnames) {
+                  const char *cn = strVal(lfirst(clc));
+                  colnames = lappend(colnames, makeString(pstrdup(cn)));
+                  colvars = lappend(colvars,
+                                    makeVar(rtindex, cidx + 1,
+                                            inf->cols[cidx].type_oid,
+                                            inf->cols[cidx].typmod,
+                                            inf->cols[cidx].collation_oid,
+                                            sublevels_up));
+                  cidx++;
+                }
+              }
+            }
+          }
+        }
+        if (colnames == NIL || colvars == NIL) {
+          continue;
+        }
+      }
+    }
+
+    if (colnames == NIL || colvars == NIL) {
+      MemoryContext saved_cxt = CurrentMemoryContext;
+      PG_TRY();
+      {
+#if PG_VERSION_NUM >= 180000
+        expandRTE(rte, rtindex, sublevels_up, VAR_RETURNING_DEFAULT, -1, false,
+                  &colnames, &colvars);
+#else
+        expandRTE(rte, rtindex, sublevels_up, -1, false, &colnames, &colvars);
+#endif
+      }
+      PG_CATCH();
+      {
+        FlushErrorState();
+        MemoryContextSwitchTo(saved_cxt);
+        colnames = NIL;
+        colvars = NIL;
+      }
+      PG_END_TRY();
+    }
+
+    if (colnames == NIL || colvars == NIL) {
+      continue;
+    }
+
+    if (!(*first_rte)) {
+      appendStringInfoChar(lat_buf, ',');
+    }
+    *first_rte = false;
+
+    appendStringInfoString(lat_buf, "{\"alias\":");
+    pljs_append_json_string(lat_buf, rte->eref->aliasname);
+    appendStringInfo(lat_buf, ",\"rtindex\":%d,\"columns\":[",
+                     sublevels_up > 0 ? -rtindex : rtindex);
+
+    forboth(name_lc, colnames, var_lc, colvars) {
+      const char *colname = strVal(lfirst(name_lc));
+      Node *varnode = (Node *)lfirst(var_lc);
+
+      CHECK_FOR_INTERRUPTS();
+      if (colname == NULL || *colname == '\0' || varnode == NULL ||
+          !IsA(varnode, Var)) {
+        continue;
+      }
+
+      Var *var = (Var *)varnode;
+      if (!OidIsValid(var->vartype) || var->varattno <= 0) {
+        continue;
+      }
+
+      if (!first_col) {
+        appendStringInfoChar(lat_buf, ',');
+      }
+      first_col = false;
+
+      appendStringInfoString(lat_buf, "{\"name\":");
+      pljs_append_json_string(lat_buf, colname);
+      appendStringInfo(
+          lat_buf,
+          ",\"attno\":%d,\"type_oid\":%u,\"typmod\":%d,\"collation_oid\":%u,"
+          "\"type_sql\":",
+          (int)var->varattno, var->vartype, var->vartypmod, var->varcollid);
+      pljs_append_json_string(
+          lat_buf, format_type_with_typemod(var->vartype, var->vartypmod));
+      appendStringInfoChar(lat_buf, '}');
+    }
+    appendStringInfoString(lat_buf, "]}");
+  }
+}
+
+static void pljs_materialize_rtfunc_for_rows_request(PlannerInfo *root,
+                                                     FuncExpr *fexpr) {
+  if (root == NULL || root->parse == NULL || fexpr == NULL) {
+    return;
+  }
+
+  RangeTblFunction *target_rtfunc = NULL;
+  ListCell *lc;
+  foreach (lc, root->parse->rtable) {
+    RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+
+    CHECK_FOR_INTERRUPTS();
+    if (rte->rtekind != RTE_FUNCTION) {
+      continue;
+    }
+    ListCell *flc;
+    foreach (flc, rte->functions) {
+      RangeTblFunction *rtf = (RangeTblFunction *)lfirst(flc);
+
+      CHECK_FOR_INTERRUPTS();
+      if (rtf->funcexpr == (Node *)fexpr) {
+        target_rtfunc = rtf;
+        break;
+      }
+      if (target_rtfunc == NULL && rtf->funccolnames == NIL &&
+          rtf->funcexpr != NULL && equal(rtf->funcexpr, (Node *)fexpr)) {
+        target_rtfunc = rtf;
+      }
+    }
+    if (target_rtfunc != NULL && target_rtfunc->funcexpr == (Node *)fexpr) {
+      break;
+    }
+  }
+  if (target_rtfunc == NULL) {
+    return;
+  }
+
+  char *raw_func_name = get_func_name(fexpr->funcid);
+  char func_name[NAMEDATALEN];
+  pljs_normalize_func_name(raw_func_name ? raw_func_name : "graph_table",
+                           func_name, sizeof(func_name));
+
+  bool is_custom_lang = false;
+  HeapTuple proctup =
+      SearchSysCache1(PROCOID, ObjectIdGetDatum(fexpr->funcid));
+  if (HeapTupleIsValid(proctup)) {
+    Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(proctup);
+    Oid prolang = procform->prolang;
+    ReleaseSysCache(proctup);
+    HeapTuple langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(prolang));
+    if (HeapTupleIsValid(langtup)) {
+      Form_pg_language langform = (Form_pg_language)GETSTRUCT(langtup);
+      char lang_name[NAMEDATALEN];
+      pljs_normalize_func_name(NameStr(langform->lanname), lang_name,
+                               sizeof(lang_name));
+      is_custom_lang = (strcmp(lang_name, "pljs") != 0 &&
+                        strcmp(lang_name, "sql") != 0 &&
+                        strcmp(lang_name, "internal") != 0 &&
+                        strcmp(lang_name, "c") != 0);
+      ReleaseSysCache(langtup);
+    }
+  }
+  if (is_custom_lang) {
+    return;
+  }
+
+  if (target_rtfunc->funccolnames == NIL) {
+    int nargs = list_length(fexpr->args);
+    if (nargs >= 1) {
+      bool source_is_first_arg =
+          (nargs == 1 ||
+           pljs_is_source_type_node((Node *)linitial(fexpr->args)));
+      char *source_str =
+          source_is_first_arg
+              ? pljs_extract_const_string((Node *)linitial(fexpr->args))
+              : (nargs >= 2
+                     ? pljs_extract_const_string((Node *)lsecond(fexpr->args))
+                     : NULL);
+      if (source_str != NULL) {
+        PljsInferredEntry *cached = pljs_find_inferred_columns(source_str);
+        if (cached != NULL && cached->ncols > 0) {
+          MemoryContext oldcxt =
+              MemoryContextSwitchTo(GetMemoryChunkContext(target_rtfunc));
+          List *colnames = NIL;
+          List *coltypes = NIL;
+          List *coltypmods = NIL;
+          List *colcollations = NIL;
+
+          for (int i = 0; i < cached->ncols; i++) {
+            CHECK_FOR_INTERRUPTS();
+            const char *cname =
+                (cached->cols[i].name[0] != '\0') ? cached->cols[i].name
+                                                  : "?column?";
+            Oid ctype = OidIsValid(cached->cols[i].type_oid)
+                            ? cached->cols[i].type_oid
+                            : TEXTOID;
+            int32 ctypmod = cached->cols[i].typmod;
+            Oid ccoll = OidIsValid(cached->cols[i].collation_oid)
+                            ? cached->cols[i].collation_oid
+                            : get_typcollation(ctype);
+
+            colnames = lappend(colnames, makeString(pstrdup(cname)));
+            coltypes = lappend_oid(coltypes, ctype);
+            coltypmods = lappend_int(coltypmods, ctypmod);
+            colcollations = lappend_oid(colcollations, ccoll);
+          }
+
+          target_rtfunc->funccolnames = colnames;
+          target_rtfunc->funccoltypes = coltypes;
+          target_rtfunc->funccoltypmods = coltypmods;
+          target_rtfunc->funccolcollations = colcollations;
+          target_rtfunc->funccolcount = cached->ncols;
+          MemoryContextSwitchTo(oldcxt);
+        }
+      }
+    }
+  }
+
+  if (target_rtfunc->funccolnames != NIL) {
+    if (fexpr->funcresulttype == RECORDOID ||
+        pljs_is_single_col_holder_type(fexpr->funcresulttype)) {
+      fexpr->funcresulttype = RECORDOID;
+    }
+    if (!root->parse->hasTargetSRFs) {
+      pljs_update_func_overloads_columns(func_name, 0, NULL);
+    }
+  }
+}
+
+Datum pljs_call_support(PG_FUNCTION_ARGS) {
+  Node *rawreq = (Node *)PG_GETARG_POINTER(0);
+
+  if (rawreq == NULL) {
+    PG_RETURN_POINTER(NULL);
+  }
+
+  if (IsA(rawreq, SupportRequestCost)) {
+    SupportRequestCost *req = (SupportRequestCost *)rawreq;
+    req->startup = 10.0;
+    req->per_tuple = 0.01;
+    PG_RETURN_POINTER(req);
+  }
+
+  if (IsA(rawreq, SupportRequestRows)) {
+    SupportRequestRows *req = (SupportRequestRows *)rawreq;
+    if (!pljs_in_support_internal_call && req->root != NULL &&
+        req->root->parse != NULL && req->node != NULL &&
+        IsA(req->node, FuncExpr)) {
+      pljs_materialize_rtfunc_for_rows_request(req->root,
+                                               (FuncExpr *)req->node);
+    }
+    req->rows = 100.0;
+    PG_RETURN_POINTER(req);
+  }
+
+  if (IsA(rawreq, SupportRequestSimplify)) {
+    SupportRequestSimplify *req = (SupportRequestSimplify *)rawreq;
+    PlannerInfo *root = req->root;
+    FuncExpr *fexpr = req->fcall;
+
+    if (pljs_in_support_internal_call || root == NULL || root->parse == NULL ||
+        fexpr == NULL) {
+      PG_RETURN_POINTER(NULL);
+    }
+
+    char *raw_func_name = get_func_name(fexpr->funcid);
+    char func_name[NAMEDATALEN];
+    pljs_normalize_func_name(raw_func_name ? raw_func_name : "graph_table",
+                             func_name, sizeof(func_name));
+
+    char lang_name[NAMEDATALEN];
+    lang_name[0] = '\0';
+    bool is_custom_lang = false;
+
+    PljsSupportHookEntry *hook =
+        pljs_find_or_create_hook_entry(func_name, false);
+    if ((hook == NULL ||
+         ((hook->support_ctx == NULL ||
+           !JS_IsFunction(hook->support_ctx, hook->support_js_cb)) &&
+          hook->support_sql_func[0] == '\0')) &&
+        lang_name[0] != '\0') {
+      PljsSupportHookEntry *lang_hook =
+          pljs_find_or_create_hook_entry(lang_name, false);
+      if (lang_hook != NULL &&
+          ((lang_hook->support_ctx != NULL &&
+            JS_IsFunction(lang_hook->support_ctx, lang_hook->support_js_cb)) ||
+           lang_hook->support_sql_func[0] != '\0')) {
+        hook = lang_hook;
+      }
+    }
+
+    int nargs = list_length(fexpr->args);
+    char *volatile first_arg_str = NULL;
+    char *volatile source_str = NULL;
+    char *volatile params_str = NULL;
+    Node *params_arg_node = NULL;
+    bool source_is_first_arg = true;
+
+    if (!is_custom_lang) {
+      if (nargs < 1) {
+        PG_RETURN_POINTER(NULL);
+      }
+      source_is_first_arg =
+          (nargs == 1 ||
+           pljs_is_source_type_node((Node *)linitial(fexpr->args)));
+
+      if (source_is_first_arg) {
+        source_str = pljs_extract_const_string((Node *)linitial(fexpr->args));
+        first_arg_str = pstrdup("");
+        if (nargs >= 2) {
+          params_arg_node = (Node *)lsecond(fexpr->args);
+        }
+      } else {
+        source_str = pljs_extract_const_string((Node *)lsecond(fexpr->args));
+        first_arg_str =
+            pljs_extract_first_arg_string((Node *)linitial(fexpr->args));
+        if (nargs >= 3) {
+          params_arg_node = (Node *)lthird(fexpr->args);
+        }
+      }
+
+      if (source_str == NULL) {
+        PG_RETURN_POINTER(NULL);
+      }
+    } else {
+      source_str = pstrdup("");
+      first_arg_str = pstrdup("");
+    }
+
+    RangeTblEntry *volatile target_rte = NULL;
+    RangeTblFunction *volatile target_rtfunc = NULL;
+    RangeTblEntry *fallback_rte = NULL;
+    RangeTblFunction *fallback_rtfunc = NULL;
+    ListCell *lc;
+
+    foreach (lc, root->parse->rtable) {
+      RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+
+      CHECK_FOR_INTERRUPTS();
+      if (rte->rtekind == RTE_FUNCTION && list_length(rte->functions) == 1) {
+        RangeTblFunction *rtfunc =
+            (RangeTblFunction *)linitial(rte->functions);
+
+        if (rtfunc->funcexpr != NULL && IsA(rtfunc->funcexpr, FuncExpr)) {
+          FuncExpr *rte_fe = (FuncExpr *)rtfunc->funcexpr;
+
+          if (rte_fe == fexpr) {
+            target_rte = rte;
+            target_rtfunc = rtfunc;
+            break;
+          }
+          if (rte_fe->funcid == fexpr->funcid &&
+              list_length(rte_fe->args) == nargs) {
+            bool already_visited = (rte_fe->location == -2);
+            bool exact_match = equal(rte_fe, fexpr);
+            bool src_match = false;
+
+            if (!exact_match && !is_custom_lang &&
+                list_length(rte_fe->args) >= (source_is_first_arg ? 1 : 2)) {
+              Node *src_node = source_is_first_arg
+                                   ? (Node *)linitial(rte_fe->args)
+                                   : (Node *)lsecond(rte_fe->args);
+              char *rte_src = pljs_extract_const_string(src_node);
+
+              if (rte_src != NULL && strcmp(rte_src, source_str) == 0) {
+                src_match = true;
+              }
+            }
+
+            if (exact_match || src_match || is_custom_lang) {
+              if (!already_visited) {
+                target_rte = rte;
+                target_rtfunc = rtfunc;
+                if (exact_match || src_match) {
+                  break;
+                }
+              } else if (fallback_rte == NULL) {
+                fallback_rte = rte;
+                fallback_rtfunc = rtfunc;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (target_rte == NULL) {
+      target_rte = fallback_rte;
+      target_rtfunc = fallback_rtfunc;
+    }
+
+    if (target_rte == NULL) {
+      PG_RETURN_POINTER(NULL);
+    }
+
+    if (target_rtfunc->funcexpr != NULL &&
+        IsA(target_rtfunc->funcexpr, FuncExpr)) {
+      ((FuncExpr *)target_rtfunc->funcexpr)->location = -2;
+    }
+    fexpr->location = -2;
+
+    StringInfoData expected_cols_buf;
+    initStringInfo(&expected_cols_buf);
+    appendStringInfoChar(&expected_cols_buf, '[');
+
+    int expected_ncols = 0;
+    pljs_inferred_col expected_cols[FUNC_MAX_ARGS];
+
+    if (target_rtfunc->funccolnames != NIL) {
+      ListCell *cn_lc;
+      ListCell *ct_lc;
+      ListCell *cm_lc;
+      ListCell *cc_lc;
+      bool first = true;
+
+      forfour(cn_lc, target_rtfunc->funccolnames, ct_lc,
+              target_rtfunc->funccoltypes, cm_lc,
+              target_rtfunc->funccoltypmods, cc_lc,
+              target_rtfunc->funccolcollations) {
+        const char *cname = strVal(lfirst(cn_lc));
+        Oid ctype = lfirst_oid(ct_lc);
+        int32 ctypmod = lfirst_int(cm_lc);
+        Oid ccoll = lfirst_oid(cc_lc);
+
+        CHECK_FOR_INTERRUPTS();
+        if (!first) {
+          appendStringInfoChar(&expected_cols_buf, ',');
+        }
+        first = false;
+
+        appendStringInfoString(&expected_cols_buf, "{\"name\":");
+        pljs_append_json_string(&expected_cols_buf, cname);
+        appendStringInfo(&expected_cols_buf,
+                         ",\"type_oid\":%u,\"typmod\":%d,\"collation_oid\":%u,"
+                         "\"type_sql\":",
+                         ctype, ctypmod, ccoll);
+        pljs_append_json_string(&expected_cols_buf,
+                                format_type_with_typemod(ctype, ctypmod));
+        appendStringInfoChar(&expected_cols_buf, '}');
+
+        if (expected_ncols < FUNC_MAX_ARGS) {
+          strlcpy(expected_cols[expected_ncols].name,
+                  cname ? cname : "?column?", NAMEDATALEN);
+          expected_cols[expected_ncols].type_oid = ctype;
+          expected_cols[expected_ncols].typmod = ctypmod;
+          expected_cols[expected_ncols].collation_oid = ccoll;
+          expected_ncols++;
+        }
+      }
+    } else if (!is_custom_lang) {
+      PljsInferredEntry *cached = pljs_find_inferred_columns(source_str);
+      if (cached != NULL && cached->ncols > 0) {
+        for (int i = 0; i < cached->ncols; i++) {
+          CHECK_FOR_INTERRUPTS();
+          if (i > 0) {
+            appendStringInfoChar(&expected_cols_buf, ',');
+          }
+          appendStringInfoString(&expected_cols_buf, "{\"name\":");
+          pljs_append_json_string(&expected_cols_buf, cached->cols[i].name);
+          appendStringInfo(&expected_cols_buf,
+                           ",\"type_oid\":%u,\"typmod\":%d,\"collation_oid\":"
+                           "%u,\"type_sql\":",
+                           cached->cols[i].type_oid, cached->cols[i].typmod,
+                           cached->cols[i].collation_oid);
+          pljs_append_json_string(
+              &expected_cols_buf,
+              format_type_with_typemod(cached->cols[i].type_oid,
+                                       cached->cols[i].typmod));
+          appendStringInfoChar(&expected_cols_buf, '}');
+
+          if (expected_ncols < FUNC_MAX_ARGS) {
+            expected_cols[expected_ncols++] = cached->cols[i];
+          }
+        }
+      }
+    }
+
+    if (expected_ncols == 0) {
+      Oid res_type_oid = InvalidOid;
+      TupleDesc res_tupdesc = NULL;
+      TypeFuncClass tfc =
+          get_expr_result_type((Node *)fexpr, &res_type_oid, &res_tupdesc);
+      if ((tfc == TYPEFUNC_COMPOSITE || tfc == TYPEFUNC_COMPOSITE_DOMAIN) &&
+          res_tupdesc != NULL) {
+        bool first = true;
+        for (int i = 0; i < res_tupdesc->natts; i++) {
+          Form_pg_attribute att = TupleDescAttr(res_tupdesc, i);
+          if (att->attisdropped) {
+            continue;
+          }
+          if (!first) {
+            appendStringInfoChar(&expected_cols_buf, ',');
+          }
+          first = false;
+          const char *cname = NameStr(att->attname);
+          appendStringInfoString(&expected_cols_buf, "{\"name\":");
+          pljs_append_json_string(&expected_cols_buf, cname);
+          appendStringInfo(
+              &expected_cols_buf,
+              ",\"type_oid\":%u,\"typmod\":%d,\"collation_oid\":%u,"
+              "\"type_sql\":",
+              att->atttypid, att->atttypmod, att->attcollation);
+          pljs_append_json_string(
+              &expected_cols_buf,
+              format_type_with_typemod(att->atttypid, att->atttypmod));
+          appendStringInfoChar(&expected_cols_buf, '}');
+          if (expected_ncols < FUNC_MAX_ARGS) {
+            strlcpy(expected_cols[expected_ncols].name,
+                    cname[0] ? cname : "?column?", NAMEDATALEN);
+            expected_cols[expected_ncols].type_oid = att->atttypid;
+            expected_cols[expected_ncols].typmod = att->atttypmod;
+            expected_cols[expected_ncols].collation_oid = att->attcollation;
+            expected_ncols++;
+          }
+        }
+      } else if (tfc == TYPEFUNC_SCALAR && OidIsValid(res_type_oid)) {
+        const char *cname =
+            (target_rte->eref != NULL && target_rte->eref->colnames != NIL)
+                ? strVal(linitial(target_rte->eref->colnames))
+                : func_name;
+        int32 ctypmod = exprTypmod((Node *)fexpr);
+        Oid ccoll = exprCollation((Node *)fexpr);
+        appendStringInfoString(&expected_cols_buf, "{\"name\":");
+        pljs_append_json_string(&expected_cols_buf, cname);
+        appendStringInfo(&expected_cols_buf,
+                         ",\"type_oid\":%u,\"typmod\":%d,\"collation_oid\":%u,"
+                         "\"type_sql\":",
+                         res_type_oid, ctypmod, ccoll);
+        pljs_append_json_string(&expected_cols_buf,
+                                format_type_with_typemod(res_type_oid, ctypmod));
+        appendStringInfoChar(&expected_cols_buf, '}');
+        strlcpy(expected_cols[0].name,
+                (cname && cname[0]) ? cname : "?column?", NAMEDATALEN);
+        expected_cols[0].type_oid = res_type_oid;
+        expected_cols[0].typmod = ctypmod;
+        expected_cols[0].collation_oid = ccoll;
+        expected_ncols = 1;
+      }
+    }
+    appendStringInfoChar(&expected_cols_buf, ']');
+
+    if (!is_custom_lang) {
+      if (first_arg_str == NULL) {
+        PljsInferredEntry *cached = pljs_find_inferred_columns(source_str);
+        if (cached != NULL && cached->first_arg != NULL) {
+          first_arg_str = pstrdup(cached->first_arg);
+        }
+      }
+      if (first_arg_str == NULL) {
+        if (target_rtfunc->funccolnames != NIL) {
+          pljs_update_func_overloads_columns(func_name, 0, NULL);
+        }
+        PG_RETURN_POINTER(NULL);
+      }
+
+      if (params_arg_node != NULL && !pljs_is_null_const_node(params_arg_node)) {
+        params_str = pljs_extract_const_string(params_arg_node);
+        if (params_str == NULL) {
+          if (target_rtfunc->funccolnames != NIL) {
+            pljs_update_func_overloads_columns(func_name, 0, NULL);
+          }
+          PG_RETURN_POINTER(NULL);
+        }
+      }
+    }
+
+    StringInfoData lateral_env_buf;
+    bool first_rte = true;
+    initStringInfo(&lateral_env_buf);
+    appendStringInfoChar(&lateral_env_buf, '[');
+    pljs_append_rtable_to_lateral_json(&lateral_env_buf, root->parse->rtable,
+                                       target_rte, 0, &first_rte);
+
+    if (root->parent_root != NULL && root->parent_root->parse != NULL) {
+      pljs_append_rtable_to_lateral_json(&lateral_env_buf,
+                                         root->parent_root->parse->rtable, NULL,
+                                         1, &first_rte);
+    }
+    appendStringInfoChar(&lateral_env_buf, ']');
+
+    char *compiled_tsv = NULL;
+    char *volatile sql_str = NULL;
+    List *volatile lateral_args = NIL;
+    Oid lateral_arg_oids[FUNC_MAX_ARGS];
+    int nlateral = 0;
+    volatile bool pass_call_args = false;
+
+    if (hook != NULL && hook->support_ctx != NULL &&
+        JS_IsFunction(hook->support_ctx, hook->support_js_cb)) {
+      JSContext *ctx = hook->support_ctx;
+      JSValue req_obj = JS_NewObject(ctx);
+      JS_SetPropertyStr(ctx, req_obj, "request_type",
+                        JS_NewString(ctx, "simplify"));
+      JS_SetPropertyStr(ctx, req_obj, "func_oid",
+                        JS_NewUint32(ctx, fexpr->funcid));
+      JS_SetPropertyStr(ctx, req_obj, "func_name",
+                        JS_NewString(ctx, func_name));
+      JS_SetPropertyStr(ctx, req_obj, "lang_name",
+                        JS_NewString(ctx, lang_name));
+      JS_SetPropertyStr(ctx, req_obj, "nargs", JS_NewInt32(ctx, nargs));
+      JS_SetPropertyStr(ctx, req_obj, "is_from_clause", JS_TRUE);
+      JS_SetPropertyStr(
+          ctx, req_obj, "has_coldeflist",
+          JS_NewBool(ctx, target_rtfunc->funccolnames != NIL ? 1 : 0));
+      JS_SetPropertyStr(ctx, req_obj, "first_arg",
+                        JS_NewString(ctx, first_arg_str ? first_arg_str : ""));
+      JS_SetPropertyStr(ctx, req_obj, "source_arg",
+                        JS_NewString(ctx, source_str ? source_str : ""));
+
+      JSValue call_args_arr = JS_NewArray(ctx);
+      int arg_idx = 0;
+      ListCell *alc;
+      foreach (alc, fexpr->args) {
+        Node *anode = (Node *)lfirst(alc);
+        JSValue aobj = JS_NewObject(ctx);
+        Oid atype = exprType(anode);
+        int32 atypmod = exprTypmod(anode);
+        Oid acoll = exprCollation(anode);
+        bool is_null_c = pljs_is_null_const_node(anode);
+        char *cval = is_null_c ? NULL : pljs_extract_const_string(anode);
+        bool is_const = (is_null_c || cval != NULL);
+
+        JS_SetPropertyStr(ctx, aobj, "index", JS_NewInt32(ctx, arg_idx + 1));
+        JS_SetPropertyStr(ctx, aobj, "type_oid", JS_NewUint32(ctx, atype));
+        JS_SetPropertyStr(ctx, aobj, "typmod", JS_NewInt32(ctx, atypmod));
+        JS_SetPropertyStr(ctx, aobj, "collation_oid", JS_NewUint32(ctx, acoll));
+        JS_SetPropertyStr(
+            ctx, aobj, "type_sql",
+            JS_NewString(ctx, format_type_with_typemod(atype, atypmod)));
+        JS_SetPropertyStr(ctx, aobj, "is_const",
+                          JS_NewBool(ctx, is_const ? 1 : 0));
+        JS_SetPropertyStr(ctx, aobj, "is_null",
+                          JS_NewBool(ctx, is_null_c ? 1 : 0));
+        if (cval != NULL) {
+          JS_SetPropertyStr(ctx, aobj, "const_val", JS_NewString(ctx, cval));
+        } else {
+          JS_SetPropertyStr(ctx, aobj, "const_val", JS_NULL);
+        }
+        JS_SetPropertyUint32(ctx, call_args_arr, (uint32_t)arg_idx, aobj);
+        arg_idx++;
+      }
+      JS_SetPropertyStr(ctx, req_obj, "call_args", call_args_arr);
+
+      if (params_str != NULL) {
+        JSValue pval =
+            JS_ParseJSON(ctx, params_str, strlen(params_str), "<params>");
+        if (JS_IsException(pval)) {
+          JS_FreeValue(ctx, JS_GetException(ctx));
+          pval = JS_NULL;
+        }
+        JS_SetPropertyStr(ctx, req_obj, "params", pval);
+      } else {
+        JS_SetPropertyStr(ctx, req_obj, "params", JS_NULL);
+      }
+      JSValue exp_cols_val = JS_ParseJSON(
+          ctx, expected_cols_buf.data, expected_cols_buf.len, "<expected_cols>");
+      if (JS_IsException(exp_cols_val)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        exp_cols_val = JS_NewArray(ctx);
+      }
+      JS_SetPropertyStr(ctx, req_obj, "expected_columns", exp_cols_val);
+
+      JSValue lat_env_val = JS_ParseJSON(
+          ctx, lateral_env_buf.data, lateral_env_buf.len, "<lateral_env>");
+      if (JS_IsException(lat_env_val)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        lat_env_val = JS_NewArray(ctx);
+      }
+      JS_SetPropertyStr(ctx, req_obj, "lateral_env", lat_env_val);
+
+      JSValue res = JS_UNDEFINED;
+      char *hook_err = NULL;
+      pljs_in_support_internal_call = true;
+      bool ok = pljs_hook_call(ctx, hook->support_js_cb, 1, &req_obj, true,
+                               &res, &hook_err);
+      pljs_in_support_internal_call = false;
+      JS_FreeValue(ctx, req_obj);
+
+      if (!ok) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("%s", hook_err ? hook_err
+                                       : "planner support callback failed")));
+      }
+
+      {
+        if (JS_IsString(res)) {
+          const char *cs = JS_ToCString(ctx, res);
+          if (cs != NULL) {
+            compiled_tsv = pstrdup(cs);
+            JS_FreeCString(ctx, cs);
+          }
+        } else if (JS_IsObject(res) && !JS_IsNull(res)) {
+          JSValue sql_val = JS_GetPropertyStr(ctx, res, "sql");
+          if (JS_IsString(sql_val)) {
+            const char *scs = JS_ToCString(ctx, sql_val);
+            if (scs != NULL) {
+              sql_str = pstrdup(scs);
+              JS_FreeCString(ctx, scs);
+            }
+          }
+          JS_FreeValue(ctx, sql_val);
+
+          JSValue pca_val = JS_GetPropertyStr(ctx, res, "pass_call_args");
+          if (JS_IsBool(pca_val) && JS_ToBool(ctx, pca_val) > 0) {
+            pass_call_args = true;
+          }
+          JS_FreeValue(ctx, pca_val);
+
+          JSValue cols_val = JS_GetPropertyStr(ctx, res, "columns");
+          if (JS_IsArray(ctx, cols_val)) {
+            pljs_inferred_col ccols[FUNC_MAX_ARGS];
+            int nccols = pljs_extract_cols_from_js_array(ctx, cols_val, ccols);
+            if (expected_ncols == 0 && nccols > 0) {
+              for (int i = 0; i < nccols; i++) {
+                expected_cols[i] = ccols[i];
+              }
+              expected_ncols = nccols;
+            }
+          }
+          JS_FreeValue(ctx, cols_val);
+
+          JSValue lvars_val = JS_GetPropertyStr(ctx, res, "lateral_vars");
+          if (JS_IsArray(ctx, lvars_val)) {
+            int32_t llen = pljs_js_array_length(lvars_val, ctx);
+            for (int32_t i = 0; i < llen && nlateral < FUNC_MAX_ARGS; i++) {
+              JSValue lelem =
+                  JS_GetPropertyUint32(ctx, lvars_val, (uint32_t)i);
+              if (!JS_IsObject(lelem) || JS_IsNull(lelem)) {
+                JS_FreeValue(ctx, lelem);
+                continue;
+              }
+              int32_t raw_rtindex = 0;
+              int varlevelsup = 0;
+              int32_t attno_i = 0;
+              uint32_t vtype_u = 0;
+              int32_t vtypmod = -1;
+              uint32_t vcoll_u = 0;
+
+              JSValue v = JS_GetPropertyStr(ctx, lelem, "rtindex");
+              if (JS_IsNumber(v)) {
+                (void)JS_ToInt32(ctx, &raw_rtindex, v);
+              }
+              JS_FreeValue(ctx, v);
+              if (raw_rtindex < 0) {
+                raw_rtindex = -raw_rtindex;
+                varlevelsup = 1;
+              }
+
+              v = JS_GetPropertyStr(ctx, lelem, "attno");
+              if (JS_IsNumber(v)) {
+                (void)JS_ToInt32(ctx, &attno_i, v);
+              }
+              JS_FreeValue(ctx, v);
+
+              v = JS_GetPropertyStr(ctx, lelem, "type_oid");
+              if (JS_IsNumber(v)) {
+                (void)JS_ToUint32(ctx, &vtype_u, v);
+              }
+              JS_FreeValue(ctx, v);
+
+              v = JS_GetPropertyStr(ctx, lelem, "typmod");
+              if (JS_IsNumber(v)) {
+                (void)JS_ToInt32(ctx, &vtypmod, v);
+              }
+              JS_FreeValue(ctx, v);
+
+              v = JS_GetPropertyStr(ctx, lelem, "collation_oid");
+              if (JS_IsNumber(v)) {
+                (void)JS_ToUint32(ctx, &vcoll_u, v);
+              }
+              JS_FreeValue(ctx, v);
+              JS_FreeValue(ctx, lelem);
+
+              if (raw_rtindex > 0 && attno_i > 0 && OidIsValid((Oid)vtype_u)) {
+                Var *vnode =
+                    makeVar((Index)raw_rtindex, (AttrNumber)attno_i,
+                            (Oid)vtype_u, vtypmod, (Oid)vcoll_u,
+                            (Index)varlevelsup);
+                lateral_args = lappend(lateral_args, vnode);
+                lateral_arg_oids[nlateral++] = (Oid)vtype_u;
+              }
+            }
+          }
+          JS_FreeValue(ctx, lvars_val);
+        }
+        JS_FreeValue(ctx, res);
+      }
+    } else {
+      Oid compile_oid = pljs_find_support_sql_func_oid(func_name);
+      if (!OidIsValid(compile_oid) && lang_name[0] != '\0') {
+        compile_oid = pljs_find_support_sql_func_oid(lang_name);
+      }
+      if (!OidIsValid(compile_oid)) {
+        if (!is_custom_lang && target_rtfunc->funccolnames != NIL) {
+          pljs_update_func_overloads_columns(func_name, 0, NULL);
+        }
+        PG_RETURN_POINTER(NULL);
+      }
+
+      pljs_in_support_internal_call = true;
+      PG_TRY();
+      {
+        Datum compiled_datum = OidFunctionCall5(
+            compile_oid, CStringGetTextDatum(first_arg_str),
+            CStringGetTextDatum(source_str),
+            CStringGetTextDatum(expected_cols_buf.data),
+            CStringGetTextDatum(lateral_env_buf.data),
+            CStringGetTextDatum(params_str ? params_str : ""));
+        compiled_tsv = TextDatumGetCString(compiled_datum);
+      }
+      PG_FINALLY();
+      {
+        pljs_in_support_internal_call = false;
+      }
+      PG_END_TRY();
+    }
+
+    if (compiled_tsv != NULL) {
+      char *copy = pstrdup(compiled_tsv);
+      char *saveptr = NULL;
+      int line_idx = 0;
+      pljs_inferred_col compiled_cols[FUNC_MAX_ARGS];
+      int ncompiled_cols = 0;
+
+      for (char *line = strtok_r(copy, "\n", &saveptr); line != NULL;
+           line = strtok_r(NULL, "\n", &saveptr)) {
+        CHECK_FOR_INTERRUPTS();
+        if (line_idx == 0 && strncmp(line, "SQL\t", 4) == 0) {
+          sql_str = pstrdup(line + 4);
+          line_idx++;
+          continue;
+        }
+        if (strcmp(line, "PASS_CALL_ARGS\t1") == 0) {
+          pass_call_args = true;
+        } else if (strncmp(line, "COL\t", 4) == 0 &&
+                   ncompiled_cols < FUNC_MAX_ARGS) {
+          char *p1 = line + 4;
+          char *t1 = strchr(p1, '\t');
+          if (t1 != NULL) {
+            *t1 = '\0';
+            char *t2 = strchr(t1 + 1, '\t');
+            if (t2 != NULL) {
+              *t2 = '\0';
+              char *t3 = strchr(t2 + 1, '\t');
+              if (t3 != NULL) {
+                *t3 = '\0';
+              }
+              strlcpy(compiled_cols[ncompiled_cols].name,
+                      p1[0] ? p1 : "?column?", NAMEDATALEN);
+              compiled_cols[ncompiled_cols].type_oid = (Oid)atooid(t1 + 1);
+              compiled_cols[ncompiled_cols].typmod = atoi(t2 + 1);
+              compiled_cols[ncompiled_cols].collation_oid =
+                  t3 ? (Oid)atooid(t3 + 1) : InvalidOid;
+              ncompiled_cols++;
+            }
+          }
+        } else if (strncmp(line, "LAT\t", 4) == 0 && nlateral < FUNC_MAX_ARGS) {
+          char *p1 = line + 4;
+          char *t1 = strchr(p1, '\t');
+          if (t1 != NULL) {
+            *t1 = '\0';
+            char *t2 = strchr(t1 + 1, '\t');
+            if (t2 != NULL) {
+              *t2 = '\0';
+              char *t3 = strchr(t2 + 1, '\t');
+              if (t3 != NULL) {
+                *t3 = '\0';
+                char *t4 = strchr(t3 + 1, '\t');
+                if (t4 != NULL) {
+                  *t4 = '\0';
+                }
+
+                int raw_rtindex = atoi(p1);
+                int varlevelsup = 0;
+                if (raw_rtindex < 0) {
+                  raw_rtindex = -raw_rtindex;
+                  varlevelsup = 1;
+                }
+                AttrNumber attno = (AttrNumber)atoi(t1 + 1);
+                Oid vtype = (Oid)atooid(t2 + 1);
+                int32 vtypmod = atoi(t3 + 1);
+                Oid vcoll = t4 ? (Oid)atooid(t4 + 1) : InvalidOid;
+
+                Var *vnode = makeVar((Index)raw_rtindex, attno, vtype, vtypmod,
+                                     vcoll, (Index)varlevelsup);
+                lateral_args = lappend(lateral_args, vnode);
+                lateral_arg_oids[nlateral++] = vtype;
+              }
+            }
+          }
+        }
+        line_idx++;
+      }
+
+      if (expected_ncols == 0 && ncompiled_cols > 0) {
+        for (int i = 0; i < ncompiled_cols; i++) {
+          expected_cols[i] = compiled_cols[i];
+        }
+        expected_ncols = ncompiled_cols;
+      }
+    }
+
+    if (sql_str == NULL || *sql_str == '\0') {
+      if (!is_custom_lang && target_rtfunc->funccolnames != NIL) {
+        pljs_update_func_overloads_columns(func_name, 0, NULL);
+      }
+      PG_RETURN_POINTER(NULL);
+    }
+
+    if (!is_custom_lang) {
+      pljs_update_func_overloads_columns(func_name, 0, NULL);
+    }
+
+    List *helper_args = NIL;
+    Oid helper_arg_oids[FUNC_MAX_ARGS];
+    int n_helper_args = 0;
+    bool has_nonconst_arg = (nlateral > 0);
+
+    if (pass_call_args) {
+      ListCell *alc;
+      foreach (alc, fexpr->args) {
+        Node *anode = (Node *)lfirst(alc);
+        if (n_helper_args >= FUNC_MAX_ARGS) {
+          break;
+        }
+        helper_args = lappend(helper_args, copyObjectImpl(anode));
+        helper_arg_oids[n_helper_args++] = exprType(anode);
+        if (!IsA(anode, Const)) {
+          has_nonconst_arg = true;
+        }
+      }
+    }
+    if (nlateral > 0) {
+      ListCell *llc;
+      int lidx = 0;
+      foreach (llc, lateral_args) {
+        if (n_helper_args >= FUNC_MAX_ARGS) {
+          break;
+        }
+        helper_args = lappend(helper_args, lfirst(llc));
+        helper_arg_oids[n_helper_args++] = lateral_arg_oids[lidx++];
+      }
+    }
+
+    int helper_ncols = target_rtfunc->funccolnames != NIL ? 0 : expected_ncols;
+    Oid target_rettype = fexpr->funcresulttype;
+    if (OidIsValid(target_rettype) && target_rettype != RECORDOID &&
+        !pljs_is_single_col_holder_type(target_rettype) && helper_ncols > 0) {
+      HeapTuple rttup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(target_rettype));
+      if (HeapTupleIsValid(rttup)) {
+        Form_pg_type rtform = (Form_pg_type)GETSTRUCT(rttup);
+        if (rtform->typtype == TYPTYPE_COMPOSITE) {
+          helper_ncols = 0;
+        }
+        ReleaseSysCache(rttup);
+      }
+    }
+
+    uint64 slot_hash =
+        pljs_fnv1a64(14695981039346656037ULL, sql_str, strlen(sql_str));
+    slot_hash =
+        pljs_fnv1a64(slot_hash, &n_helper_args, sizeof(n_helper_args));
+    if (n_helper_args > 0) {
+      slot_hash = pljs_fnv1a64(slot_hash, helper_arg_oids,
+                               sizeof(Oid) * n_helper_args);
+    }
+    slot_hash = pljs_fnv1a64(slot_hash, &target_rettype, sizeof(Oid));
+    slot_hash = pljs_fnv1a64(slot_hash, &helper_ncols, sizeof(helper_ncols));
+    for (int i = 0; i < helper_ncols; i++) {
+      slot_hash = pljs_fnv1a64(slot_hash, expected_cols[i].name,
+                               strlen(expected_cols[i].name) + 1);
+      slot_hash =
+          pljs_fnv1a64(slot_hash, &expected_cols[i].type_oid, sizeof(Oid));
+    }
+
+    int base_slot = (int)(slot_hash % PLJS_NUM_INLINE_HELPERS);
+    Oid helper_oid = InvalidOid;
+    for (int probe = 0; probe < PLJS_NUM_INLINE_HELPERS; probe++) {
+      int slot_idx = (base_slot + probe) % PLJS_NUM_INLINE_HELPERS;
+      char helper_name[64];
+      snprintf(helper_name, sizeof(helper_name), "pljs_inline_helper_%d",
+               slot_idx);
+      Oid cand_oid = pljs_lookup_func_oid_by_name_nargs(helper_name, -1);
+      if (!OidIsValid(cand_oid)) {
+        snprintf(helper_name, sizeof(helper_name), "plv8_inline_helper_%d",
+                 slot_idx);
+        cand_oid = pljs_lookup_func_oid_by_name_nargs(helper_name, -1);
+      }
+      if (!OidIsValid(cand_oid)) {
+        snprintf(helper_name, sizeof(helper_name), "plpgq_inline_helper_%d",
+                 slot_idx);
+        cand_oid = pljs_lookup_func_oid_by_name_nargs(helper_name, -1);
+      }
+      if (!OidIsValid(cand_oid)) {
+        continue;
+      }
+
+      bool in_use = false;
+      if (root->parse != NULL) {
+        ListCell *rlc;
+        foreach (rlc, root->parse->rtable) {
+          RangeTblEntry *rte = (RangeTblEntry *)lfirst(rlc);
+          if (rte == target_rte || rte->rtekind != RTE_FUNCTION) {
+            continue;
+          }
+          ListCell *flc;
+          foreach (flc, rte->functions) {
+            RangeTblFunction *rtf = (RangeTblFunction *)lfirst(flc);
+            if (rtf->funcexpr && IsA(rtf->funcexpr, FuncExpr) &&
+                ((FuncExpr *)rtf->funcexpr)->funcid == cand_oid) {
+              in_use = true;
+              break;
+            }
+          }
+          if (in_use) {
+            break;
+          }
+        }
+      }
+      if (!in_use) {
+        helper_oid = cand_oid;
+        break;
+      }
+      if (!OidIsValid(helper_oid)) {
+        helper_oid = cand_oid;
+      }
+    }
+    if (!OidIsValid(helper_oid)) {
+      PG_RETURN_POINTER(NULL);
+    }
+
+    pljs_update_proc_table_columns(helper_oid, helper_ncols, expected_cols,
+                                   sql_str, n_helper_args, helper_arg_oids,
+                                   target_rettype);
+
+    if (has_nonconst_arg) {
+      target_rte->lateral = true;
+    }
+
+    FuncExpr *new_fexpr =
+        makeFuncExpr(helper_oid, get_func_rettype(helper_oid), helper_args,
+                     fexpr->funccollid, fexpr->inputcollid,
+                     COERCE_EXPLICIT_CALL);
+    new_fexpr->funcretset = true;
+
+    PG_RETURN_POINTER(new_fexpr);
+  }
+
+  PG_RETURN_POINTER(NULL);
 }
 
 Datum pljs_base_type_in(PG_FUNCTION_ARGS) {

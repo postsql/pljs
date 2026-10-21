@@ -3,19 +3,26 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/tupconvert.h"
 #include "access/xact.h"
+#include "catalog/pg_proc.h"
 #include "executor/spi.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "nodes/params.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
+#include "storage/itemptr.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/fmgrprotos.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
+#include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "windowapi.h"
 
@@ -54,6 +61,20 @@ static JSValue pljs_find_function(JSContext *, JSValueConst, int,
 static JSValue pljs_return_next(JSContext *, JSValueConst, int, JSValueConst *);
 static JSValue pljs_return_next_internal(JSContext *, pljs_return_state *,
                                          JSValueConst);
+static JSValue pljs_expected_columns(JSContext *, JSValueConst, int,
+                                     JSValueConst *);
+static JSValue pljs_return_query(JSContext *, JSValueConst, int,
+                                 JSValueConst *);
+static JSValue pljs_register_column_inference(JSContext *, JSValueConst, int,
+                                              JSValueConst *);
+static JSValue pljs_register_support(JSContext *, JSValueConst, int,
+                                     JSValueConst *);
+static JSValue pljs_set_function_columns(JSContext *, JSValueConst, int,
+                                         JSValueConst *);
+static JSValue pljs_current_setting(JSContext *, JSValueConst, int,
+                                    JSValueConst *);
+static JSValue pljs_proc_cache_key(JSContext *, JSValueConst, int,
+                                   JSValueConst *);
 
 static JSValue pljs_get_window_object(JSContext *, JSValueConst, int,
                                       JSValueConst *);
@@ -419,6 +440,33 @@ void pljs_setup_namespace(JSContext *ctx) {
 
   JS_SetPropertyStr(ctx, pljs, "return_next",
                     JS_NewCFunction(ctx, pljs_return_next, "return_next", 0));
+
+  JS_SetPropertyStr(
+      ctx, pljs, "expected_columns",
+      JS_NewCFunction(ctx, pljs_expected_columns, "expected_columns", 0));
+
+  JS_SetPropertyStr(ctx, pljs, "return_query",
+                    JS_NewCFunction(ctx, pljs_return_query, "return_query", 2));
+
+  JS_SetPropertyStr(ctx, pljs, "register_column_inference",
+                    JS_NewCFunction(ctx, pljs_register_column_inference,
+                                    "register_column_inference", 2));
+
+  JS_SetPropertyStr(
+      ctx, pljs, "register_support",
+      JS_NewCFunction(ctx, pljs_register_support, "register_support", 2));
+
+  JS_SetPropertyStr(ctx, pljs, "set_function_columns",
+                    JS_NewCFunction(ctx, pljs_set_function_columns,
+                                    "set_function_columns", 2));
+
+  JS_SetPropertyStr(
+      ctx, pljs, "current_setting",
+      JS_NewCFunction(ctx, pljs_current_setting, "current_setting", 2));
+
+  JS_SetPropertyStr(
+      ctx, pljs, "proc_cache_key",
+      JS_NewCFunction(ctx, pljs_proc_cache_key, "proc_cache_key", 1));
 
   JS_SetPropertyStr(
       ctx, pljs, "get_window_object",
@@ -2844,6 +2892,656 @@ static JSValue pljs_return_next(JSContext *ctx, JSValueConst this_val, int argc,
   }
 
   return result;
+}
+
+static JSValue pljs_expected_columns(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return pljs_throw_ending(ctx);
+  }
+
+  pljs_storage *storage = pljs_current_storage();
+  if (storage == NULL || storage->return_state == NULL ||
+      storage->return_state->tuple_desc == NULL) {
+    return JS_NULL;
+  }
+
+  TupleDesc tupdesc = storage->return_state->tuple_desc;
+  JSValue result = JS_NewArray(ctx);
+  if (JS_IsException(result)) {
+    return JS_EXCEPTION;
+  }
+
+  uint32_t out_idx = 0;
+  for (int i = 0; i < tupdesc->natts; i++) {
+    Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+    if (attr->attisdropped) {
+      continue;
+    }
+
+    JSValue col_obj = JS_NewObject(ctx);
+    if (JS_IsException(col_obj)) {
+      JS_FreeValue(ctx, result);
+      return JS_EXCEPTION;
+    }
+
+    const char *attname = NameStr(attr->attname);
+    JS_SetPropertyStr(ctx, col_obj, "name",
+                      pljs_new_server_string(ctx, attname, strlen(attname)));
+    JS_SetPropertyStr(ctx, col_obj, "type_oid",
+                      JS_NewUint32(ctx, attr->atttypid));
+    JS_SetPropertyStr(ctx, col_obj, "typmod",
+                      JS_NewInt32(ctx, attr->atttypmod));
+    JS_SetPropertyStr(ctx, col_obj, "collation_oid",
+                      JS_NewUint32(ctx, attr->attcollation));
+
+    char *type_sql = NULL;
+    MemoryContext m_mcontext = CurrentMemoryContext;
+    PG_TRY();
+    {
+      type_sql = format_type_with_typemod(attr->atttypid, attr->atttypmod);
+    }
+    PG_CATCH();
+    {
+      FlushErrorState();
+      MemoryContextSwitchTo(m_mcontext);
+      type_sql = NULL;
+    }
+    PG_END_TRY();
+
+    const char *ts = type_sql ? type_sql : "text";
+    JS_SetPropertyStr(ctx, col_obj, "type_sql",
+                      pljs_new_server_string(ctx, ts, strlen(ts)));
+    JS_SetPropertyStr(ctx, col_obj, "type_name",
+                      pljs_new_server_string(ctx, ts, strlen(ts)));
+    if (type_sql != NULL) {
+      pfree(type_sql);
+    }
+
+    JS_SetPropertyUint32(ctx, result, out_idx++, col_obj);
+  }
+
+  return result;
+}
+
+static void pljs_stream_spi_to_tuplestore(pljs_storage *storage,
+                                          pljs_return_state *retstate,
+                                          uint64 nproc) {
+  if (SPI_tuptable == NULL || nproc == 0) {
+    return;
+  }
+
+  TupleDesc spi_td = SPI_tuptable->tupdesc;
+  TupleDesc expected_td = retstate->tuple_desc;
+
+  if (expected_td->natts == 1 &&
+      TupleDescAttr(expected_td, 0)->atttypid == RECORDOID &&
+      storage->fcinfo != NULL && storage->fcinfo->resultinfo != NULL) {
+    ReturnSetInfo *rsinfo = (ReturnSetInfo *)storage->fcinfo->resultinfo;
+    MemoryContext oldcxt =
+        MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    TupleDesc blessed = CreateTupleDescCopy(spi_td);
+    BlessTupleDesc(blessed);
+    MemoryContextSwitchTo(oldcxt);
+
+    for (uint64 r = 0; r < nproc; r++) {
+      CHECK_FOR_INTERRUPTS();
+      HeapTuple spi_tup = SPI_tuptable->vals[r];
+      HeapTuple copy_tup = heap_copytuple(spi_tup);
+      HeapTupleHeaderSetTypeId(copy_tup->t_data, blessed->tdtypeid);
+      HeapTupleHeaderSetTypMod(copy_tup->t_data, blessed->tdtypmod);
+      Datum d = HeapTupleGetDatum(copy_tup);
+      bool isnull = false;
+      tuplestore_putvalues(retstate->tuple_store_state, expected_td, &d,
+                           &isnull);
+      heap_freetuple(copy_tup);
+    }
+    return;
+  }
+
+  int spi_cols[FUNC_MAX_ARGS];
+  int n_spi_cols = 0;
+  for (int a = 0; a < spi_td->natts && n_spi_cols < FUNC_MAX_ARGS; a++) {
+    if (!TupleDescAttr(spi_td, a)->attisdropped) {
+      spi_cols[n_spi_cols++] = a;
+    }
+  }
+
+  Datum *values = (Datum *)palloc0(sizeof(Datum) * expected_td->natts);
+  bool *nulls = (bool *)palloc0(sizeof(bool) * expected_td->natts);
+
+  for (uint64 r = 0; r < nproc; r++) {
+    HeapTuple spi_tup = SPI_tuptable->vals[r];
+    int logical_idx = 0;
+
+    CHECK_FOR_INTERRUPTS();
+
+    for (int exp_att = 0; exp_att < expected_td->natts; exp_att++) {
+      Form_pg_attribute exp_attr = TupleDescAttr(expected_td, exp_att);
+      if (exp_attr->attisdropped) {
+        nulls[exp_att] = true;
+        values[exp_att] = (Datum)0;
+        continue;
+      }
+
+      if (logical_idx >= n_spi_cols) {
+        nulls[exp_att] = true;
+        values[exp_att] = (Datum)0;
+        logical_idx++;
+        continue;
+      }
+
+      int spi_att = spi_cols[logical_idx++];
+      Form_pg_attribute spi_attr = TupleDescAttr(spi_td, spi_att);
+      bool isnull = false;
+      Datum d = heap_getattr(spi_tup, spi_att + 1, spi_td, &isnull);
+
+      if (isnull) {
+        nulls[exp_att] = true;
+        values[exp_att] = (Datum)0;
+      } else if (spi_attr->atttypid == exp_attr->atttypid ||
+                 IsBinaryCoercible(spi_attr->atttypid, exp_attr->atttypid)) {
+        nulls[exp_att] = false;
+        values[exp_att] = d;
+      } else {
+        Oid typoutput;
+        bool typisvarlena;
+        Oid typinput;
+        Oid typioparam;
+        char *str_val;
+
+        getTypeOutputInfo(spi_attr->atttypid, &typoutput, &typisvarlena);
+        str_val = OidOutputFunctionCall(typoutput, d);
+        getTypeInputInfo(exp_attr->atttypid, &typinput, &typioparam);
+        values[exp_att] = OidInputFunctionCall(typinput, str_val, typioparam,
+                                               exp_attr->atttypmod);
+        nulls[exp_att] = false;
+        pfree(str_val);
+      }
+    }
+
+    tuplestore_putvalues(retstate->tuple_store_state, expected_td, values,
+                         nulls);
+  }
+
+  pfree(values);
+  pfree(nulls);
+}
+
+static JSValue pljs_return_query(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return pljs_throw_ending(ctx);
+  }
+
+  pljs_storage *storage = pljs_current_storage();
+  pljs_return_state *retstate = storage != NULL ? storage->return_state : NULL;
+  if (retstate == NULL || retstate->tuple_store_state == NULL ||
+      retstate->tuple_desc == NULL) {
+    return js_throw("return_query called in context that cannot accept a set",
+                    ctx);
+  }
+
+  if (argc < 1 || JS_IsUndefined(argv[0]) || JS_IsNull(argv[0])) {
+    return js_throw("return_query requires a SQL query string", ctx);
+  }
+
+  char *sql = pljs_string_arg(ctx, argv[0]);
+  if (sql == NULL) {
+    return JS_EXCEPTION;
+  }
+
+  JSValue params = {0};
+  bool cleanup_params = false;
+  int nparam = 0;
+
+  if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+    if (JS_IsArray(ctx, argv[1])) {
+      params = argv[1];
+    } else {
+      params = pljs_values_to_array(argv, argc, 1, ctx);
+      cleanup_params = true;
+    }
+    nparam = pljs_js_array_length(params, ctx);
+    if (nparam < 0) {
+      if (cleanup_params) {
+        JS_FreeValue(ctx, params);
+      }
+      pfree(sql);
+      return JS_EXCEPTION;
+    }
+  }
+
+  MemoryContext m_mcontext = CurrentMemoryContext;
+  pljs_subxact sx;
+  ErrorData *edata;
+  volatile uint64 nproc = 0;
+
+  pljs_subxact_init(&sx);
+
+  PG_TRY();
+  {
+    int status;
+
+    if (!IsTransactionOrTransactionBlock()) {
+      ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      errmsg("transaction lock failure")));
+    }
+
+    pljs_subxact_begin(&sx, false);
+
+    if (nparam == 0) {
+      status = SPI_execute(sql, false, 0);
+    } else {
+      status = pljs_execute_params(sql, params, ctx);
+    }
+
+    if (status < 0) {
+      elog(ERROR, "pljs.return_query failed: %s",
+           SPI_result_code_string(status));
+    }
+
+    nproc = SPI_processed;
+
+    if (SPI_tuptable != NULL) {
+      pljs_stream_spi_to_tuplestore(storage, retstate, nproc);
+      SPI_freetuptable(SPI_tuptable);
+    }
+
+    MemoryContextSwitchTo(m_mcontext);
+  }
+  PG_CATCH();
+  {
+    edata = pljs_subxact_abort(&sx);
+    if (cleanup_params) {
+      JS_FreeValue(ctx, params);
+    }
+    pfree(sql);
+    return pljs_throw_caught_error(edata, ctx);
+  }
+  PG_END_TRY();
+
+  edata = pljs_subxact_commit(&sx);
+  pfree(sql);
+  if (cleanup_params) {
+    JS_FreeValue(ctx, params);
+  }
+  if (edata != NULL) {
+    return pljs_throw_caught_error(edata, ctx);
+  }
+
+  return JS_NewInt32(ctx, (int32_t)nproc);
+}
+static JSValue pljs_register_column_inference(JSContext *ctx,
+                                              JSValueConst this_val, int argc,
+                                              JSValueConst *argv) {
+  if (argc < 2 || !JS_IsString(argv[0])) {
+    return js_throw("pljs.register_column_inference(func_name, handler) "
+                    "requires a function name and a callback or SQL function "
+                    "name",
+                    ctx);
+  }
+
+  const char *func_name = JS_ToCString(ctx, argv[0]);
+  if (func_name == NULL) {
+    return JS_EXCEPTION;
+  }
+
+  if (JS_IsFunction(ctx, argv[1])) {
+    pljs_register_col_inference_for_func(func_name, NULL, ctx, argv[1]);
+  } else if (JS_IsString(argv[1])) {
+    const char *sql_fn = JS_ToCString(ctx, argv[1]);
+    pljs_register_col_inference_for_func(func_name, sql_fn, ctx, JS_UNDEFINED);
+    if (sql_fn) {
+      JS_FreeCString(ctx, sql_fn);
+    }
+  } else if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+    pljs_register_col_inference_for_func(func_name, NULL, ctx, JS_UNDEFINED);
+  } else {
+    JS_FreeCString(ctx, func_name);
+    return js_throw("pljs.register_column_inference second argument must be a "
+                    "Function, string, or null",
+                    ctx);
+  }
+
+  JS_FreeCString(ctx, func_name);
+  return JS_TRUE;
+}
+
+static JSValue pljs_register_support(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+  if (argc < 2 || !JS_IsString(argv[0])) {
+    return js_throw("pljs.register_support(func_name, handler) requires a "
+                    "function name and a callback or SQL function name",
+                    ctx);
+  }
+
+  const char *func_name = JS_ToCString(ctx, argv[0]);
+  if (func_name == NULL) {
+    return JS_EXCEPTION;
+  }
+
+  if (JS_IsFunction(ctx, argv[1])) {
+    pljs_register_support_for_func(func_name, NULL, ctx, argv[1]);
+  } else if (JS_IsString(argv[1])) {
+    const char *sql_fn = JS_ToCString(ctx, argv[1]);
+    pljs_register_support_for_func(func_name, sql_fn, ctx, JS_UNDEFINED);
+    if (sql_fn) {
+      JS_FreeCString(ctx, sql_fn);
+    }
+  } else if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+    pljs_register_support_for_func(func_name, NULL, ctx, JS_UNDEFINED);
+  } else {
+    JS_FreeCString(ctx, func_name);
+    return js_throw("pljs.register_support second argument must be a Function, "
+                    "string, or null",
+                    ctx);
+  }
+
+  JS_FreeCString(ctx, func_name);
+  return JS_TRUE;
+}
+
+static JSValue pljs_set_function_columns(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return pljs_throw_ending(ctx);
+  }
+
+  if (argc < 2 || !JS_IsString(argv[0])) {
+    return js_throw("pljs.set_function_columns(func_name, columns) requires a "
+                    "function name and columns array or null",
+                    ctx);
+  }
+
+  char *func_name = pljs_string_arg(ctx, argv[0]);
+  if (func_name == NULL) {
+    return JS_EXCEPTION;
+  }
+
+  if (JS_IsNull(argv[1]) || JS_IsUndefined(argv[1])) {
+    MemoryContext m_mcontext = CurrentMemoryContext;
+    PG_TRY();
+    {
+      (void)pljs_set_func_columns(func_name, 0, NULL);
+    }
+    PG_CATCH();
+    {
+      ErrorData *edata = pljs_catch_error(m_mcontext);
+      pfree(func_name);
+      return pljs_throw_caught_error(edata, ctx);
+    }
+    PG_END_TRY();
+    pfree(func_name);
+    return JS_TRUE;
+  }
+
+  if (!JS_IsArray(ctx, argv[1])) {
+    pfree(func_name);
+    return js_throw(
+        "pljs.set_function_columns second argument must be an Array or null",
+        ctx);
+  }
+
+  pljs_inferred_col cols[FUNC_MAX_ARGS];
+  volatile int ncols = 0;
+
+  int32_t len = pljs_js_array_length(argv[1], ctx);
+  if (len < 0) {
+    pfree(func_name);
+    return JS_EXCEPTION;
+  }
+  if (len > FUNC_MAX_ARGS) {
+    len = FUNC_MAX_ARGS;
+  }
+
+  for (volatile int32_t i = 0; i < len; i++) {
+    JSValue elem = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
+    if (!JS_IsObject(elem) || JS_IsNull(elem)) {
+      JS_FreeValue(ctx, elem);
+      continue;
+    }
+
+    JSValue name_val = JS_GetPropertyStr(ctx, elem, "name");
+    const char *cname =
+        JS_IsString(name_val) ? JS_ToCString(ctx, name_val) : NULL;
+    strlcpy(cols[ncols].name,
+            (cname && cname[0]) ? cname : "?column?", NAMEDATALEN);
+    if (cname) {
+      JS_FreeCString(ctx, cname);
+    }
+    JS_FreeValue(ctx, name_val);
+
+    Oid typid = InvalidOid;
+    int32 typmod = -1;
+    volatile Oid coll_oid = InvalidOid;
+
+    JSValue oid_val = JS_GetPropertyStr(ctx, elem, "type_oid");
+    uint32_t oid_num = 0;
+    if (JS_IsNumber(oid_val) && JS_ToUint32(ctx, &oid_num, oid_val) == 0 &&
+        oid_num != 0) {
+      typid = (Oid)oid_num;
+    }
+    JS_FreeValue(ctx, oid_val);
+
+    JSValue tm_val = JS_GetPropertyStr(ctx, elem, "typmod");
+    int32_t tm_num = -1;
+    if (JS_IsNumber(tm_val) && JS_ToInt32(ctx, &tm_num, tm_val) == 0) {
+      typmod = tm_num;
+    }
+    JS_FreeValue(ctx, tm_val);
+
+    JSValue coll_val = JS_GetPropertyStr(ctx, elem, "collation_oid");
+    uint32_t coll_num = 0;
+    if (JS_IsNumber(coll_val) && JS_ToUint32(ctx, &coll_num, coll_val) == 0) {
+      coll_oid = (Oid)coll_num;
+    }
+    JS_FreeValue(ctx, coll_val);
+
+    if (!OidIsValid(typid)) {
+      JSValue tstr_val = JS_GetPropertyStr(ctx, elem, "type");
+      if (!JS_IsString(tstr_val)) {
+        JS_FreeValue(ctx, tstr_val);
+        tstr_val = JS_GetPropertyStr(ctx, elem, "type_sql");
+      }
+      if (!JS_IsString(tstr_val)) {
+        JS_FreeValue(ctx, tstr_val);
+        tstr_val = JS_GetPropertyStr(ctx, elem, "type_name");
+      }
+      if (JS_IsString(tstr_val)) {
+        const char *tstr = JS_ToCString(ctx, tstr_val);
+        if (tstr != NULL) {
+          MemoryContext saved_cxt = CurrentMemoryContext;
+          PG_TRY();
+          {
+#if PG_VERSION_NUM >= 160000
+            (void)parseTypeString(tstr, &typid, &typmod, NULL);
+#else
+            (void)parseTypeString(tstr, &typid, &typmod, false);
+#endif
+          }
+          PG_CATCH();
+          {
+            FlushErrorState();
+            MemoryContextSwitchTo(saved_cxt);
+            typid = TEXTOID;
+            typmod = -1;
+          }
+          PG_END_TRY();
+          JS_FreeCString(ctx, tstr);
+        }
+      }
+      JS_FreeValue(ctx, tstr_val);
+    }
+    JS_FreeValue(ctx, elem);
+
+    if (!OidIsValid(typid)) {
+      typid = TEXTOID;
+    }
+
+    cols[ncols].type_oid = typid;
+    cols[ncols].typmod = typmod;
+    cols[ncols].collation_oid = coll_oid;
+    ncols++;
+  }
+
+  MemoryContext m_mcontext = CurrentMemoryContext;
+  PG_TRY();
+  {
+    (void)pljs_set_func_columns(func_name, ncols, cols);
+  }
+  PG_CATCH();
+  {
+    ErrorData *edata = pljs_catch_error(m_mcontext);
+    pfree(func_name);
+    return pljs_throw_caught_error(edata, ctx);
+  }
+  PG_END_TRY();
+
+  pfree(func_name);
+  return JS_TRUE;
+}
+
+static JSValue pljs_current_setting(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return JS_EXCEPTION;
+  }
+  if (argc < 1 || !JS_IsString(argv[0])) {
+    return JS_NULL;
+  }
+
+  bool missing_ok = false;
+  if (argc >= 2) {
+    missing_ok = (JS_ToBool(ctx, argv[1]) > 0);
+  }
+
+  const char *name_cstr = JS_ToCString(ctx, argv[0]);
+  if (name_cstr == NULL) {
+    return JS_NULL;
+  }
+
+  const char *val = NULL;
+  MemoryContext m_mcontext = CurrentMemoryContext;
+  PG_TRY();
+  {
+    val = GetConfigOptionByName(name_cstr, NULL, missing_ok);
+  }
+  PG_CATCH();
+  {
+    if (missing_ok) {
+      FlushErrorState();
+      MemoryContextSwitchTo(m_mcontext);
+      val = NULL;
+    } else {
+      ErrorData *edata = pljs_catch_error(m_mcontext);
+      JS_FreeCString(ctx, name_cstr);
+      return pljs_throw_caught_error(edata, ctx);
+    }
+  }
+  PG_END_TRY();
+
+  JS_FreeCString(ctx, name_cstr);
+
+  if (val == NULL) {
+    return JS_NULL;
+  }
+  return JS_NewString(ctx, val);
+}
+
+static JSValue pljs_proc_cache_key(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+  if (pljs_call_is_ending()) {
+    return JS_EXCEPTION;
+  }
+  if (argc < 1) {
+    return JS_NULL;
+  }
+
+  Oid func_oid = InvalidOid;
+
+  if (JS_IsNumber(argv[0])) {
+    uint32_t u = 0;
+    if (JS_ToUint32(ctx, &u, argv[0]) == 0 && u > 0) {
+      func_oid = (Oid)u;
+    } else {
+      return JS_NULL;
+    }
+  } else if (JS_IsString(argv[0])) {
+    const char *spec_str = JS_ToCString(ctx, argv[0]);
+    if (spec_str == NULL || spec_str[0] == '\0') {
+      if (spec_str != NULL) {
+        JS_FreeCString(ctx, spec_str);
+      }
+      return JS_NULL;
+    }
+
+    if (spec_str[0] == '*' && spec_str[1] == '\0') {
+      JS_FreeCString(ctx, spec_str);
+      char gen_buf[32];
+      snprintf(gen_buf, sizeof(gen_buf), "gen:%llu",
+               (unsigned long long)pljs_get_catalog_gen());
+      return JS_NewString(ctx, gen_buf);
+    }
+
+    char *endp = NULL;
+    unsigned long ul = strtoul(spec_str, &endp, 10);
+    if (endp != spec_str && *endp == '\0' && ul > 0 && ul <= (unsigned long)OID_MAX) {
+      func_oid = (Oid)ul;
+    } else {
+      MemoryContext saved_cxt = CurrentMemoryContext;
+      Datum spec_datum = CStringGetTextDatum(spec_str);
+      PG_TRY();
+      {
+        if (strchr(spec_str, '(') != NULL) {
+          Datum res = DirectFunctionCall1(to_regprocedure, spec_datum);
+          func_oid = DatumGetObjectId(res);
+        } else {
+          Datum res = DirectFunctionCall1(to_regproc, spec_datum);
+          func_oid = DatumGetObjectId(res);
+          if (!OidIsValid(func_oid)) {
+            res = DirectFunctionCall1(to_regprocedure, spec_datum);
+            func_oid = DatumGetObjectId(res);
+          }
+        }
+      }
+      PG_CATCH();
+      {
+        FlushErrorState();
+        MemoryContextSwitchTo(saved_cxt);
+        func_oid = InvalidOid;
+      }
+      PG_END_TRY();
+      pfree(DatumGetPointer(spec_datum));
+    }
+
+    JS_FreeCString(ctx, spec_str);
+  } else {
+    return JS_NULL;
+  }
+
+  if (!OidIsValid(func_oid)) {
+    return JS_NULL;
+  }
+
+  HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(func_oid));
+  if (!HeapTupleIsValid(proctup)) {
+    return JS_NULL;
+  }
+
+  TransactionId xmin = HeapTupleHeaderGetRawXmin(proctup->t_data);
+  CommandId cmin = HeapTupleHeaderGetRawCommandId(proctup->t_data);
+  ItemPointerData tid = proctup->t_self;
+  BlockNumber blk = ItemPointerGetBlockNumber(&tid);
+  OffsetNumber off = ItemPointerGetOffsetNumber(&tid);
+  ReleaseSysCache(proctup);
+
+  char key_buf[96];
+  snprintf(key_buf, sizeof(key_buf), "%u:%u:%u:(%u,%u):%llu",
+           (unsigned int)func_oid, (unsigned int)xmin, (unsigned int)cmin,
+           (unsigned int)blk, (unsigned int)off,
+           (unsigned long long)pljs_get_catalog_gen());
+  return JS_NewString(ctx, key_buf);
 }
 
 /**

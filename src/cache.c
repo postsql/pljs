@@ -774,6 +774,8 @@ void pljs_function_cache_to_context(pljs_context *context,
   }
   context->function->preserve_numeric_precision =
       function_entry->preserve_numeric_precision;
+  context->function->pass_user_types_as_bytes =
+      function_entry->pass_user_types_as_bytes;
 
   context->js_function = function_entry->fn;
 
@@ -828,6 +830,8 @@ void pljs_context_to_function_cache(pljs_function_cache_value *function_entry,
   }
   function_entry->preserve_numeric_precision =
       context->function->preserve_numeric_precision;
+  function_entry->pass_user_types_as_bytes =
+      context->function->pass_user_types_as_bytes;
 
   function_entry->fn = context->js_function;
   function_entry->nargs = context->function->inargs;

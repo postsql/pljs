@@ -571,6 +571,124 @@ SELECT test_custom_lang_import(14) AS custom_lang_import_result;
 
 DROP FUNCTION test_custom_lang_import(int);
 DELETE FROM pljs.modules WHERE path = 'custom_lang_mod';
+-- 10. Superuser-only pass_user_types_as_bytes and pljs.allow_raw_user_types gating
+SET client_min_messages = warning;
+CREATE TYPE raw_test_type;
+CREATE FUNCTION raw_test_type_in(cstring) RETURNS raw_test_type
+  LANGUAGE internal IMMUTABLE STRICT AS 'byteain';
+CREATE FUNCTION raw_test_type_out(raw_test_type) RETURNS cstring
+  LANGUAGE internal IMMUTABLE STRICT AS 'byteaout';
+CREATE TYPE raw_test_type (
+  INTERNALLENGTH = VARIABLE,
+  INPUT = raw_test_type_in,
+  OUTPUT = raw_test_type_out,
+  CATEGORY = 'U'
+);
+RESET client_min_messages;
+-- 10a. Normal LANGUAGE pljs cannot return raw Uint8Array for a user-defined type
+CREATE FUNCTION raw_test_normal_pljs() RETURNS raw_test_type AS $$
+  return new Uint8Array([0x41, 0x42, 0x43]);
+$$ LANGUAGE pljs;
+\set VERBOSITY terse
+SELECT raw_test_normal_pljs();
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+\set VERBOSITY default
+-- 10b. Non-superuser language handler cannot enable pass_user_types_as_bytes
+SET ROLE regress_pljs_lang_user;
+CREATE FUNCTION unpriv_raw_handler() RETURNS language_handler AS $$
+  if (arguments[1]) arguments[1].pass_user_types_as_bytes = true;
+  return arguments[0];
+$$ LANGUAGE pljs;
+RESET ROLE;
+CREATE LANGUAGE unpriv_raw_lang HANDLER unpriv_raw_handler;
+CREATE FUNCTION unpriv_raw_fn() RETURNS raw_test_type AS $$
+  return new Uint8Array([0x41, 0x42]);
+$$ LANGUAGE unpriv_raw_lang;
+\set VERBOSITY terse
+SELECT unpriv_raw_fn();
+ERROR:  must be superuser to enable pass_user_types_as_bytes
+\set VERBOSITY default
+-- 10c. Superuser language handler with pass_user_types_as_bytes succeeds when allow_raw_user_types = on,
+-- and fails when pljs.allow_raw_user_types = off
+CREATE FUNCTION super_raw_handler() RETURNS language_handler AS $$
+  if (arguments[1]) arguments[1].pass_user_types_as_bytes = true;
+  return arguments[0];
+$$ LANGUAGE pljs;
+CREATE LANGUAGE super_raw_lang HANDLER super_raw_handler;
+CREATE FUNCTION super_raw_roundtrip(v raw_test_type) RETURNS raw_test_type AS $$
+  const out = new Uint8Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] + 1;
+  return out;
+$$ LANGUAGE super_raw_lang;
+CREATE FUNCTION super_raw_arr(v raw_test_type[]) RETURNS raw_test_type[] AS $$
+  return v.map(x => {
+    const out = new Uint8Array(x.length);
+    for (let i = 0; i < x.length; i++) out[i] = x[i] + 1;
+    return out;
+  });
+$$ LANGUAGE super_raw_lang;
+CREATE TYPE raw_comp AS (r raw_test_type, n int);
+CREATE FUNCTION super_raw_comp(v raw_comp) RETURNS raw_comp AS $$
+  const out = new Uint8Array(v.r.length);
+  for (let i = 0; i < v.r.length; i++) out[i] = v.r[i] + 1;
+  return { r: out, n: v.n + 1 };
+$$ LANGUAGE super_raw_lang;
+SHOW pljs.allow_raw_user_types;
+ pljs.allow_raw_user_types 
+---------------------------
+ off
+(1 row)
+
+\set VERBOSITY terse
+SELECT super_raw_roundtrip('\x414243'::raw_test_type);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+SELECT super_raw_arr(ARRAY['\x41'::raw_test_type, '\x42'::raw_test_type]);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+SELECT super_raw_comp(ROW('\x41'::raw_test_type, 6)::raw_comp);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+\set VERBOSITY default
+SET pljs.allow_raw_user_types = on;
+SELECT super_raw_roundtrip('\x414243'::raw_test_type);
+ super_raw_roundtrip 
+---------------------
+ \x424344
+(1 row)
+
+SELECT super_raw_arr(ARRAY['\x41'::raw_test_type, '\x42'::raw_test_type]);
+   super_raw_arr   
+-------------------
+ {"\\x42","\\x43"}
+(1 row)
+
+SELECT super_raw_comp(ROW('\x41'::raw_test_type, 6)::raw_comp);
+ super_raw_comp 
+----------------
+ ("\\x42",7)
+(1 row)
+
+RESET pljs.allow_raw_user_types;
+\set VERBOSITY terse
+SELECT super_raw_roundtrip('\x414243'::raw_test_type);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+SELECT super_raw_arr(ARRAY['\x41'::raw_test_type, '\x42'::raw_test_type]);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+SELECT super_raw_comp(ROW('\x41'::raw_test_type, 6)::raw_comp);
+ERROR:  returning raw byte buffers for user-defined type raw_test_type requires superuser pass_user_types_as_bytes
+\set VERBOSITY default
+DROP FUNCTION super_raw_comp(raw_comp);
+DROP TYPE raw_comp;
+DROP FUNCTION super_raw_arr(raw_test_type[]);
+DROP FUNCTION super_raw_roundtrip(raw_test_type);
+DROP LANGUAGE super_raw_lang;
+DROP FUNCTION super_raw_handler();
+DROP FUNCTION unpriv_raw_fn();
+DROP LANGUAGE unpriv_raw_lang;
+DROP FUNCTION unpriv_raw_handler();
+DROP FUNCTION raw_test_normal_pljs();
+DROP TYPE raw_test_type CASCADE;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function raw_test_type_in(cstring)
+drop cascades to function raw_test_type_out(raw_test_type)
 -- Cleanup
 DROP FUNCTION test_other_lang(int);
 DROP LANGUAGE other_lang;

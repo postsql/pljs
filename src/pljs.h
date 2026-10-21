@@ -94,6 +94,7 @@ typedef struct pljs_configuration {
   int hooks_max_depth;
   int max_module_depth;
   int max_cached_contexts;
+  bool allow_raw_user_types;
 
   // Hook function name GUCs.
   char *hook_executor_start;
@@ -170,6 +171,7 @@ typedef struct pljs_function_cache_value {
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
   bool preserve_numeric_precision;
+  bool pass_user_types_as_bytes;
 } pljs_function_cache_value;
 
 typedef struct pljs_param_state {
@@ -241,6 +243,7 @@ typedef struct pljs_func {
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
   bool preserve_numeric_precision;
+  bool pass_user_types_as_bytes;
 
   bool trigger;
   bool is_srf;                  // are we a set returning function?
@@ -289,7 +292,10 @@ extern JSClassID js_window_id;
 Datum pljs_call_handler(PG_FUNCTION_ARGS);
 Datum pljs_call_validator(PG_FUNCTION_ARGS);
 Datum pljs_inline_handler(PG_FUNCTION_ARGS);
+Datum pljs_base_type_in(PG_FUNCTION_ARGS);
+Datum pljs_base_type_out(PG_FUNCTION_ARGS);
 extern bool pljs_preserve_numeric_precision;
+extern bool pljs_pass_user_types_as_bytes;
 
 // Extension initialization
 void _PG_init(void);

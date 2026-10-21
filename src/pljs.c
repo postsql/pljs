@@ -1,15 +1,19 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "parser/parse_func.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -34,6 +38,8 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pljs_call_handler);
 PG_FUNCTION_INFO_V1(pljs_call_validator);
 PG_FUNCTION_INFO_V1(pljs_inline_handler);
+PG_FUNCTION_INFO_V1(pljs_base_type_in);
+PG_FUNCTION_INFO_V1(pljs_base_type_out);
 
 static Datum call_function(PG_FUNCTION_ARGS, pljs_context *context,
                            JSValueConst *argv);
@@ -112,6 +118,7 @@ static ErrorData *pljs_fatal_error(void) {
  */
 bool pljs_converting_result = false;
 bool pljs_preserve_numeric_precision = false;
+bool pljs_pass_user_types_as_bytes = false;
 
 /**
  * @brief Creates and configures the QuickJS runtime.
@@ -339,6 +346,15 @@ void pljs_guc_init(void) {
                    "inactive context is evicted before a new one is cached."),
       &configuration.max_cached_contexts, 64, 1, 1024, PGC_SUSET, 0, NULL,
       pljs_assign_max_cached_contexts, NULL);
+
+  DefineCustomBoolVariable(
+      "pljs.allow_raw_user_types",
+      gettext_noop("Allow passing user-defined base types (TYPCATEGORY_USER) "
+                   "as raw Uint8Array byte buffers."),
+      gettext_noop("Restricted to superuser-owned functions/handlers with "
+                   "pass_user_types_as_bytes enabled."),
+      &configuration.allow_raw_user_types, false, PGC_SUSET, 0,
+      pljs_hook_bool_check, NULL, NULL);
 
   // Hook GUCs - each names a PLJS function to call for the given hook.
   // All require superuser and pljs.hooks_enabled = true at runtime.
@@ -1495,12 +1511,14 @@ static void pljs_run_with_storage(JSContext *ctx, pljs_func *function,
   pljs_storage storage;
   pljs_storage *previous_storage = current_storage;
   bool prev_pnp = pljs_preserve_numeric_precision;
+  bool prev_putb = pljs_pass_user_types_as_bytes;
   volatile bool connected = false;
 
   setup_storage(&storage, ctx, function, fcinfo);
   current_storage = &storage;
   if (function != NULL) {
     pljs_preserve_numeric_precision = function->preserve_numeric_precision;
+    pljs_pass_user_types_as_bytes = function->pass_user_types_as_bytes;
   }
 
   PG_TRY();
@@ -1575,6 +1593,7 @@ static void pljs_run_with_storage(JSContext *ctx, pljs_func *function,
 
     current_storage = previous_storage;
     pljs_preserve_numeric_precision = prev_pnp;
+    pljs_pass_user_types_as_bytes = prev_putb;
   }
   PG_END_TRY();
 
@@ -1770,6 +1789,48 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
           (errmsg("pl/<any>: prolang %u, lanname [%s], lang_is_pljs: %d",
                   prolang, lanname, lang_is_pljs)));
 
+  bool all_handlers_superuser = true;
+  bool is_wasm_lang = false;
+  {
+    Oid cur_lang = prolang;
+    for (int depth = 0;
+         depth < PLJS_MAX_LANG_HANDLER_DEPTH && OidIsValid(cur_lang);
+         depth++) {
+      HeapTuple lt =
+          SearchSysCache(LANGOID, ObjectIdGetDatum(cur_lang), 0, 0, 0);
+      if (!HeapTupleIsValid(lt)) {
+        break;
+      }
+      Form_pg_language ls = (Form_pg_language)GETSTRUCT(lt);
+      if (strcmp(NameStr(ls->lanname), "pljs") == 0) {
+        ReleaseSysCache(lt);
+        break;
+      }
+      if (strcmp(NameStr(ls->lanname), "pl/v8-wasm") == 0 ||
+          strcmp(NameStr(ls->lanname), "pl/js-wasm") == 0) {
+        is_wasm_lang = true;
+      }
+      if (!superuser_arg(ls->lanowner)) {
+        all_handlers_superuser = false;
+      }
+      Oid h_oid = ls->lanplcallfoid;
+      ReleaseSysCache(lt);
+      if (!OidIsValid(h_oid)) {
+        break;
+      }
+      HeapTuple pt = SearchSysCache(PROCOID, ObjectIdGetDatum(h_oid), 0, 0, 0);
+      if (!HeapTupleIsValid(pt)) {
+        break;
+      }
+      Form_pg_proc ps = (Form_pg_proc)GETSTRUCT(pt);
+      if (!superuser_arg(ps->proowner)) {
+        all_handlers_superuser = false;
+      }
+      cur_lang = ps->prolang;
+      ReleaseSysCache(pt);
+    }
+  }
+
   if (OidIsValid(context->function->fn_oid)) {
     pljs_record_language_handlers(lanplcallfoid, context->function);
   }
@@ -1818,6 +1879,49 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
                       JS_NewString(context->ctx, context->function->proname));
     JS_SetPropertyStr(context->ctx, meta, "rettype_oid",
                       JS_NewUint32(context->ctx, context->function->rettype));
+
+    char ret_cat = '\0';
+    bool ret_pref = false;
+    int16 ret_typlen = 0;
+    if (OidIsValid(context->function->rettype)) {
+      get_type_category_preferred(context->function->rettype, &ret_cat,
+                                  &ret_pref);
+      ret_typlen = get_typlen(context->function->rettype);
+    }
+    char ret_cat_str[2] = {ret_cat, '\0'};
+    JS_SetPropertyStr(context->ctx, meta, "rettype_category",
+                      JS_NewString(context->ctx, ret_cat_str));
+    int32 ret_internal_len = (ret_typlen > (int16)VARHDRSZ)
+                                 ? (int32)(ret_typlen - VARHDRSZ)
+                                 : (int32)ret_typlen;
+    JS_SetPropertyStr(context->ctx, meta, "rettype_len",
+                      JS_NewInt32(context->ctx, ret_internal_len));
+
+    JSValue arg_oids = JS_NewArray(context->ctx);
+    JSValue arg_cats = JS_NewArray(context->ctx);
+    JSValue arg_lens = JS_NewArray(context->ctx);
+    for (int a = 0; a < context->function->inargs; a++) {
+      Oid atype = context->function->argtypes[a];
+      JS_SetPropertyUint32(context->ctx, arg_oids, (uint32_t)a,
+                           JS_NewUint32(context->ctx, atype));
+      char acat = '\0';
+      bool apref = false;
+      int16 alen_raw = 0;
+      if (OidIsValid(atype)) {
+        get_type_category_preferred(atype, &acat, &apref);
+        alen_raw = get_typlen(atype);
+      }
+      char acat_str[2] = {acat, '\0'};
+      JS_SetPropertyUint32(context->ctx, arg_cats, (uint32_t)a,
+                           JS_NewString(context->ctx, acat_str));
+      int32 alen = (alen_raw > (int16)VARHDRSZ) ? (int32)(alen_raw - VARHDRSZ)
+                                                : (int32)alen_raw;
+      JS_SetPropertyUint32(context->ctx, arg_lens, (uint32_t)a,
+                           JS_NewInt32(context->ctx, alen));
+    }
+    JS_SetPropertyStr(context->ctx, meta, "argtype_oids", arg_oids);
+    JS_SetPropertyStr(context->ctx, meta, "argtype_categories", arg_cats);
+    JS_SetPropertyStr(context->ctx, meta, "argtype_lens", arg_lens);
   } else {
     JS_SetPropertyStr(context->ctx, meta, "inline", JS_NewBool(context->ctx, 1));
   }
@@ -1856,6 +1960,28 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
     context->function->preserve_numeric_precision = true;
   }
   JS_FreeValue(context->ctx, pnp_val);
+
+  JSValue putb_val =
+      JS_GetPropertyStr(context->ctx, meta, "pass_user_types_as_bytes");
+  bool explicit_pass_bytes =
+      (JS_IsBool(putb_val) && JS_ToBool(context->ctx, putb_val) > 0);
+  JS_FreeValue(context->ctx, putb_val);
+
+  bool owner_is_superuser =
+      all_handlers_superuser &&
+      (!OidIsValid(context->function->owner_id) ||
+       superuser_arg(context->function->owner_id));
+  if (explicit_pass_bytes && !owner_is_superuser) {
+    JS_FreeValue(context->ctx, run.result);
+    JS_FreeValue(context->ctx, argv0);
+    JS_FreeValue(context->ctx, meta);
+    JS_FreeValue(context->ctx, transpiler_func);
+    ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+             errmsg("must be superuser to enable pass_user_types_as_bytes")));
+  }
+  context->function->pass_user_types_as_bytes =
+      (is_wasm_lang || explicit_pass_bytes) && owner_is_superuser;
 
   JS_FreeValue(context->ctx, argv0);
   JS_FreeValue(context->ctx, meta);
@@ -2079,7 +2205,9 @@ static Datum dispatch_call(FunctionCallInfo fcinfo) {
    * after the final read, before any JS is executed.
    */
   bool prev_pnp_arg = pljs_preserve_numeric_precision;
+  bool prev_putb_arg = pljs_pass_user_types_as_bytes;
   pljs_preserve_numeric_precision = context.function->preserve_numeric_precision;
+  pljs_pass_user_types_as_bytes = context.function->pass_user_types_as_bytes;
 
   PG_TRY();
   {
@@ -2112,6 +2240,7 @@ static Datum dispatch_call(FunctionCallInfo fcinfo) {
   {
     current_compiling_ctx = prev_compiling_ctx;
     pljs_preserve_numeric_precision = prev_pnp_arg;
+    pljs_pass_user_types_as_bytes = prev_putb_arg;
   }
   PG_END_TRY();
 
@@ -3872,4 +4001,73 @@ JSValue pljs_find_js_function(Oid fn_oid, JSContext *ctx) {
   }
 
   return func;
+}
+
+Datum pljs_base_type_in(PG_FUNCTION_ARGS) {
+  char *s = PG_GETARG_CSTRING(0);
+  if (s == NULL) {
+    PG_RETURN_NULL();
+  }
+
+  Oid funcoid = fcinfo->flinfo->fn_oid;
+  HeapTuple proc_tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+  if (!HeapTupleIsValid(proc_tp)) {
+    elog(ERROR, "cache lookup failed for function %u", funcoid);
+  }
+  Form_pg_proc proc = (Form_pg_proc)GETSTRUCT(proc_tp);
+  Oid pronamespace = proc->pronamespace;
+  char *proname = pstrdup(NameStr(proc->proname));
+  Oid typoid = proc->prorettype;
+  ReleaseSysCache(proc_tp);
+
+  Oid argtypes[1] = {TEXTOID};
+  List *qualname = list_make2(makeString(get_namespace_name(pronamespace)),
+                              makeString(proname));
+  Oid in_fn_oid = LookupFuncName(qualname, 1, argtypes, false);
+  pfree(proname);
+
+  HeapTuple tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
+  if (!HeapTupleIsValid(tp)) {
+    elog(ERROR, "cache lookup failed for type %u", typoid);
+  }
+  Form_pg_type typtup = (Form_pg_type)GETSTRUCT(tp);
+  int typeLen = typtup->typlen;
+  char *typeName = pstrdup(NameStr(typtup->typname));
+  ReleaseSysCache(tp);
+
+  Datum datum =
+      OidFunctionCall1Coll(in_fn_oid, InvalidOid, CStringGetTextDatum(s));
+  bytea *result = DatumGetByteaPP(datum);
+  if (typeLen >= 0) {
+    int inputLen = VARSIZE_ANY_EXHDR(result) + VARHDRSZ;
+    if (typeLen != inputLen) {
+      elog(ERROR,
+           "type %s is defined as fixed-size %d, but actual data length is %d",
+           typeName, typeLen, inputLen);
+    }
+  }
+  pfree(typeName);
+  PG_RETURN_POINTER(result);
+}
+
+Datum pljs_base_type_out(PG_FUNCTION_ARGS) {
+  Datum datum = PG_GETARG_DATUM(0);
+  Oid funcoid = fcinfo->flinfo->fn_oid;
+  HeapTuple proc_tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+  if (!HeapTupleIsValid(proc_tp)) {
+    elog(ERROR, "cache lookup failed for function %u", funcoid);
+  }
+  Form_pg_proc proc = (Form_pg_proc)GETSTRUCT(proc_tp);
+  Oid pronamespace = proc->pronamespace;
+  char *proname = pstrdup(NameStr(proc->proname));
+  ReleaseSysCache(proc_tp);
+
+  Oid out_argtypes[1] = {BYTEAOID};
+  List *qualname = list_make2(makeString(get_namespace_name(pronamespace)),
+                              makeString(proname));
+  Oid out_fn_oid = LookupFuncName(qualname, 1, out_argtypes, false);
+  pfree(proname);
+
+  Datum result = OidFunctionCall1Coll(out_fn_oid, InvalidOid, datum);
+  PG_RETURN_CSTRING(TextDatumGetCString(result));
 }

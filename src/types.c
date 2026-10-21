@@ -3082,6 +3082,46 @@ JSValue pljs_datum_to_jsvalue(Oid argtype, Datum arg, bool is_null,
 
   /* The cases below are those of pljs_type_has_js_case(), and only those. */
   if (!io->has_js_case) {
+    /*
+     * Direct binary buffer argument passing for pg_tle user-defined base types
+     * (TYPCATEGORY_USER, stored internally as varlena / bytea) when invoking
+     * superuser-authorized pl/<any> functions with pass_user_types_as_bytes.
+     */
+    if (pljs_pass_user_types_as_bytes && configuration.allow_raw_user_types &&
+        type.category == TYPCATEGORY_USER && !type.byval) {
+      if (type.length == -1) {
+        bytea *value = DatumGetByteaPP(arg);
+        JSValue buffer = JS_NewArrayBufferCopy(
+            ctx, (const uint8_t *)VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value));
+        pljs_free_if_detoasted(value, arg);
+        if (JS_IsException(buffer)) {
+          return pljs_checked_value(ctx, buffer);
+        }
+        JSValueConst typed_array_args[3] = {buffer, JS_UNDEFINED, JS_UNDEFINED};
+        JSValue arr =
+            JS_NewTypedArray(ctx, 3, typed_array_args, JS_TYPED_ARRAY_UINT8);
+        JS_FreeValue(ctx, buffer);
+        return pljs_checked_value(ctx, arr);
+      } else if (type.length > (int16)VARHDRSZ) {
+        const char *raw = (const char *)DatumGetPointer(arg);
+        if (raw != NULL && !VARATT_IS_EXTENDED(raw) &&
+            VARSIZE(raw) == (size_t)type.length) {
+          JSValue buffer =
+              JS_NewArrayBufferCopy(ctx, (const uint8_t *)VARDATA(raw),
+                                    (size_t)type.length - VARHDRSZ);
+          if (JS_IsException(buffer)) {
+            return pljs_checked_value(ctx, buffer);
+          }
+          JSValueConst typed_array_args[3] = {buffer, JS_UNDEFINED,
+                                              JS_UNDEFINED};
+          JSValue arr =
+              JS_NewTypedArray(ctx, 3, typed_array_args, JS_TYPED_ARRAY_UINT8);
+          JS_FreeValue(ctx, buffer);
+          return pljs_checked_value(ctx, arr);
+        }
+      }
+    }
+
     return pljs_checked_value(ctx,
                               pljs_datum_to_jsvalue_fallback(arg, io, ctx));
   }
@@ -4186,7 +4226,74 @@ static Datum pljs_jsvalue_to_datum_internal(pljs_type_io *io, int32 typmod,
   }
 
   /* The cases below are those of pljs_type_has_js_case(), and only those. */
+  /* The cases below are those of pljs_type_has_js_case(), and only those. */
   if (!io->has_js_case) {
+    /*
+     * Direct binary buffer return for pg_tle user-defined base types
+     * (stored internally as varlena / bytea with optional fixed length).
+     * Restricted strictly to superuser-owned functions/handlers with
+     * pass_user_types_as_bytes enabled and pljs.allow_raw_user_types = on.
+     */
+    if (type.category == TYPCATEGORY_USER && !type.byval &&
+        (Is_ArrayType(val, JS_CLASS_UINT8_ARRAY) ||
+         Is_ArrayType(val, JS_CLASS_INT8_ARRAY) || Is_ArrayBuffer(val))) {
+      if (!pljs_pass_user_types_as_bytes ||
+          !configuration.allow_raw_user_types) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+             errmsg("returning raw byte buffers for user-defined type %s "
+                    "requires superuser pass_user_types_as_bytes",
+                    format_type_be(type.typid))));
+      }
+
+      const uint8_t *src_bytes = NULL;
+      size_t byte_len = 0;
+
+      if (Is_ArrayType(val, JS_CLASS_UINT8_ARRAY) ||
+          Is_ArrayType(val, JS_CLASS_INT8_ARRAY)) {
+        size_t offset = 0, psize = 0;
+        JSValue ab = JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, NULL);
+        pljs_checked_value(ctx, ab);
+        uint8_t *data = JS_GetArrayBuffer(ctx, &psize, ab);
+        JS_FreeValue(ctx, ab);
+        if (data == NULL) {
+          pljs_ereport_js_exception(ctx);
+        }
+        src_bytes = data + offset;
+      } else if (Is_ArrayBuffer(val)) {
+        src_bytes = JS_GetArrayBuffer(ctx, &byte_len, val);
+        if (src_bytes == NULL && byte_len > 0) {
+          pljs_ereport_js_exception(ctx);
+        }
+      }
+
+      if (byte_len > (size_t)MaxAllocSize - VARHDRSZ) {
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("returned buffer length %zu exceeds maximum varlena size",
+                        byte_len)));
+      }
+
+      size_t varlena_size = byte_len + VARHDRSZ;
+      if (type.length > 0 && (size_t)type.length != varlena_size) {
+        ereport(
+            ERROR,
+            (errcode(ERRCODE_DATA_EXCEPTION),
+             errmsg("type %s is defined as fixed-size %d, but returned buffer "
+                    "has internal length %zu",
+                    format_type_be(type.typid), (int)type.length,
+                    varlena_size)));
+      }
+
+      void *res_varlena = palloc(varlena_size);
+      SET_VARSIZE(res_varlena, varlena_size);
+      if (byte_len > 0 && src_bytes != NULL) {
+        memcpy(VARDATA(res_varlena), src_bytes, byte_len);
+      }
+      return PointerGetDatum(res_varlena);
+    }
+
     return pljs_jsvalue_to_datum_fallback(val, is_null, io, typmod, ctx);
   }
 

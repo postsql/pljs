@@ -74,3 +74,68 @@ SELECT get_rectangles_area(130.0);
  [{"id":1,"data":{"width":20.3,"height":1.5}},{"id":2,"data":{"width":10.2,"height":9.5}},{"id":3,"data":{"width":3.5,"height":5.2}}]
 (1 row)
 
+-- Issue: Preserve original SQLSTATE and diagnostics across subtransactions
+CREATE TABLE subxact_err_tbl (
+    id int PRIMARY KEY,
+    val int NOT NULL CHECK (val > 0)
+);
+INSERT INTO subxact_err_tbl VALUES (1, 10);
+CREATE OR REPLACE FUNCTION test_subxact_unique_violation() RETURNS void AS $$
+    pljs.subtransaction(function() {
+        pljs.execute("INSERT INTO subxact_err_tbl VALUES (1, 20)");
+    });
+$$ LANGUAGE pljs;
+DO $$
+DECLARE
+    v_state text;
+    v_msg text;
+    v_detail text;
+    v_constraint text;
+    v_table text;
+BEGIN
+    PERFORM test_subxact_unique_violation();
+EXCEPTION WHEN unique_violation THEN
+    GET STACKED DIAGNOSTICS
+        v_state = RETURNED_SQLSTATE,
+        v_msg = MESSAGE_TEXT,
+        v_detail = PG_EXCEPTION_DETAIL,
+        v_constraint = CONSTRAINT_NAME,
+        v_table = TABLE_NAME;
+    RAISE NOTICE 'caught unique_violation: state=%, table=%, constraint=%, detail=%',
+        v_state, v_table, v_constraint, v_detail;
+END;
+$$;
+NOTICE:  caught unique_violation: state=23505, table=subxact_err_tbl, constraint=subxact_err_tbl_pkey, detail=Key (id)=(1) already exists.
+CREATE OR REPLACE FUNCTION test_custom_js_sqlstate() RETURNS void AS $$
+    var err = new Error("custom check violation from JS");
+    err.sqlerrcode = "23514";
+    err.detail = "val must be positive";
+    err.hint = "pass a value > 0";
+    err.table_name = "subxact_err_tbl";
+    err.constraint_name = "subxact_err_tbl_val_check";
+    throw err;
+$$ LANGUAGE pljs;
+DO $$
+DECLARE
+    v_state text;
+    v_msg text;
+    v_detail text;
+    v_hint text;
+    v_constraint text;
+BEGIN
+    PERFORM test_custom_js_sqlstate();
+EXCEPTION WHEN check_violation THEN
+    GET STACKED DIAGNOSTICS
+        v_state = RETURNED_SQLSTATE,
+        v_msg = MESSAGE_TEXT,
+        v_detail = PG_EXCEPTION_DETAIL,
+        v_hint = PG_EXCEPTION_HINT,
+        v_constraint = CONSTRAINT_NAME;
+    RAISE NOTICE 'caught check_violation: state=%, msg=%, detail=%, hint=%, constraint=%',
+        v_state, v_msg, v_detail, v_hint, v_constraint;
+END;
+$$;
+NOTICE:  caught check_violation: state=23514, msg=custom check violation from JS, detail=val must be positive, hint=pass a value > 0, constraint=subxact_err_tbl_val_check
+DROP FUNCTION test_subxact_unique_violation();
+DROP FUNCTION test_custom_js_sqlstate();
+DROP TABLE subxact_err_tbl;

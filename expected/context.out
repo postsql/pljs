@@ -116,6 +116,7 @@ ERROR:  pljs_reset() cannot be called while PL/JS code is running
 DETAIL:  Error: pljs_reset() cannot be called while PL/JS code is running
     at calls_reset_uncaught (<function>:3:15)
 
+HINT:  Call it from a top-level SQL statement, not from inside a PL/JS function, trigger or DO block.
 -- The refusals reset nothing: state set before them is still there.
 DO $$ pljs.data = { survivor: 'still here' }; $$ LANGUAGE pljs;
 SELECT calls_reset();

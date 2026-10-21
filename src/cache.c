@@ -772,6 +772,8 @@ void pljs_function_cache_to_context(pljs_context *context,
   for (int i = 0; i < function_entry->nhandlers; i++) {
     context->function->handlers[i] = function_entry->handlers[i];
   }
+  context->function->preserve_numeric_precision =
+      function_entry->preserve_numeric_precision;
 
   context->js_function = function_entry->fn;
 
@@ -824,6 +826,8 @@ void pljs_context_to_function_cache(pljs_function_cache_value *function_entry,
   for (int i = 0; i < context->function->nhandlers; i++) {
     function_entry->handlers[i] = context->function->handlers[i];
   }
+  function_entry->preserve_numeric_precision =
+      context->function->preserve_numeric_precision;
 
   function_entry->fn = context->js_function;
   function_entry->nargs = context->function->inargs;

@@ -111,6 +111,7 @@ static ErrorData *pljs_fatal_error(void) {
  * pljs_commit().
  */
 bool pljs_converting_result = false;
+bool pljs_preserve_numeric_precision = false;
 
 /**
  * @brief Creates and configures the QuickJS runtime.
@@ -1493,10 +1494,14 @@ static void pljs_run_with_storage(JSContext *ctx, pljs_func *function,
                                   void (*run)(void *), void *arg) {
   pljs_storage storage;
   pljs_storage *previous_storage = current_storage;
+  bool prev_pnp = pljs_preserve_numeric_precision;
   volatile bool connected = false;
 
   setup_storage(&storage, ctx, function, fcinfo);
   current_storage = &storage;
+  if (function != NULL) {
+    pljs_preserve_numeric_precision = function->preserve_numeric_precision;
+  }
 
   PG_TRY();
   {
@@ -1569,6 +1574,7 @@ static void pljs_run_with_storage(JSContext *ctx, pljs_func *function,
     }
 
     current_storage = previous_storage;
+    pljs_preserve_numeric_precision = prev_pnp;
   }
   PG_END_TRY();
 
@@ -1705,7 +1711,7 @@ static void pljs_record_language_handlers(Oid first_handler_oid,
 typedef struct pljs_transpile_run {
   JSContext *ctx;
   JSValue transpiler_func;
-  JSValue argv[1];
+  JSValue argv[2];
   JSValue result;
 } pljs_transpile_run;
 
@@ -1714,7 +1720,7 @@ static void transpile_run(void *arg) {
 
   JS_SetInterruptHandler(JS_GetRuntime(run->ctx), interrupt_handler, NULL);
   run->result =
-      JS_Call(run->ctx, run->transpiler_func, JS_UNDEFINED, 1, run->argv);
+      JS_Call(run->ctx, run->transpiler_func, JS_UNDEFINED, 2, run->argv);
 }
 
 /**
@@ -1804,6 +1810,18 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
     pljs_ereport_js_error_info(&errinfo, "language handler execution error");
   }
 
+  JSValue meta = JS_NewObject(context->ctx);
+  if (OidIsValid(context->function->fn_oid)) {
+    JS_SetPropertyStr(context->ctx, meta, "fn_oid",
+                      JS_NewUint32(context->ctx, context->function->fn_oid));
+    JS_SetPropertyStr(context->ctx, meta, "proname",
+                      JS_NewString(context->ctx, context->function->proname));
+    JS_SetPropertyStr(context->ctx, meta, "rettype_oid",
+                      JS_NewUint32(context->ctx, context->function->rettype));
+  } else {
+    JS_SetPropertyStr(context->ctx, meta, "inline", JS_NewBool(context->ctx, 1));
+  }
+
   pljs_func handler_func = {0};
   handler_func.fn_oid = lanplcallfoid;
   handler_func.user_id = GetUserId();
@@ -1813,7 +1831,7 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
   pljs_transpile_run run = {
       .ctx = context->ctx,
       .transpiler_func = transpiler_func,
-      .argv = {argv0},
+      .argv = {argv0, meta},
       .result = JS_UNDEFINED,
   };
 
@@ -1826,12 +1844,21 @@ static bool pljs_transpile_if_needed(pljs_context *context, Oid lang_oid) {
   {
     JS_FreeValue(context->ctx, run.result);
     JS_FreeValue(context->ctx, argv0);
+    JS_FreeValue(context->ctx, meta);
     JS_FreeValue(context->ctx, transpiler_func);
     PG_RE_THROW();
   }
   PG_END_TRY();
 
+  JSValue pnp_val =
+      JS_GetPropertyStr(context->ctx, meta, "preserve_numeric_precision");
+  if (JS_IsBool(pnp_val) && JS_ToBool(context->ctx, pnp_val) > 0) {
+    context->function->preserve_numeric_precision = true;
+  }
+  JS_FreeValue(context->ctx, pnp_val);
+
   JS_FreeValue(context->ctx, argv0);
+  JS_FreeValue(context->ctx, meta);
   JS_FreeValue(context->ctx, transpiler_func);
 
   if (JS_IsException(run.result)) {
@@ -2051,6 +2078,9 @@ static Datum dispatch_call(FunctionCallInfo fcinfo) {
    * long-running backend).  Release it at the last safe point instead: right
    * after the final read, before any JS is executed.
    */
+  bool prev_pnp_arg = pljs_preserve_numeric_precision;
+  pljs_preserve_numeric_precision = context.function->preserve_numeric_precision;
+
   PG_TRY();
   {
     if (is_trigger) {
@@ -2081,6 +2111,7 @@ static Datum dispatch_call(FunctionCallInfo fcinfo) {
   PG_FINALLY();
   {
     current_compiling_ctx = prev_compiling_ctx;
+    pljs_preserve_numeric_precision = prev_pnp_arg;
   }
   PG_END_TRY();
 
@@ -2223,7 +2254,7 @@ static void run_inline(FunctionCallInfo fcinfo) {
    */
   pljs_inline_run run = {.source = sourcecode, .ctx = ctx};
 
-  pljs_run_with_storage(ctx, NULL, fcinfo, false, inline_run, &run);
+  pljs_run_with_storage(ctx, &local_func, fcinfo, false, inline_run, &run);
 
   SPI_finish();
 }

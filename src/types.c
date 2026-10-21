@@ -2672,6 +2672,9 @@ JSValue pljs_datum_to_object(pljs_type *type, Datum arg, JSContext *ctx) {
   obj = JS_NewObject(ctx);
 
   if (tupdesc) {
+    JSValue numeric_cols = JS_UNDEFINED;
+    uint32_t num_numeric_cols = 0;
+
     /*
      * A column that does not convert raises, and the builtins hand that to
      * JavaScript, which can catch it and try again: release the row built so
@@ -2686,8 +2689,9 @@ JSValue pljs_datum_to_object(pljs_type *type, Datum arg, JSContext *ctx) {
       for (int16 i = 0; i < tupdesc->natts; i++) {
         Datum datum;
         bool isnull = false;
+        Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
 
-        if (TupleDescAttr(tupdesc, i)->attisdropped) {
+        if (attr->attisdropped) {
           continue;
         }
 
@@ -2707,13 +2711,37 @@ JSValue pljs_datum_to_object(pljs_type *type, Datum arg, JSContext *ctx) {
          * from a PostgreSQL value, as JSON.parse() builds its own.
          */
         pljs_define_column(
-            ctx, obj, TupleDescAttr(tupdesc, i),
-            pljs_datum_to_jsvalue(TupleDescAttr(tupdesc, i)->atttypid, datum,
-                                  isnull, true, ctx));
+            ctx, obj, attr,
+            pljs_datum_to_jsvalue(attr->atttypid, datum, isnull, true, ctx));
+
+        if (pljs_preserve_numeric_precision && !isnull &&
+            pljs_type_base(attr->atttypid) == NUMERICOID) {
+          if (JS_IsUndefined(numeric_cols)) {
+            numeric_cols = JS_NewArray(ctx);
+            pljs_checked_value(ctx, numeric_cols);
+          }
+          const char *colname = NameStr(attr->attname);
+          JSValue colname_val =
+              pljs_new_server_string(ctx, colname, strlen(colname));
+          pljs_checked_define(
+              ctx, JS_DefinePropertyValueUint32(
+                       ctx, numeric_cols, num_numeric_cols++, colname_val,
+                       JS_PROP_C_W_E));
+        }
+      }
+
+      if (!JS_IsUndefined(numeric_cols)) {
+        pljs_checked_define(ctx, JS_DefinePropertyValueStr(
+                                     ctx, obj, "__numeric_columns",
+                                     numeric_cols, JS_PROP_CONFIGURABLE));
+        numeric_cols = JS_UNDEFINED;
       }
     }
     PG_CATCH();
     {
+      if (!JS_IsUndefined(numeric_cols)) {
+        JS_FreeValue(ctx, numeric_cols);
+      }
       ReleaseTupleDesc(tupdesc);
       JS_FreeValue(ctx, obj);
       pljs_free_if_detoasted(rec, arg);
@@ -3095,9 +3123,27 @@ JSValue pljs_datum_to_jsvalue(Oid argtype, Datum arg, bool is_null,
     return_result = JS_NewFloat64(ctx, DatumGetFloat8(arg));
     break;
 
-  case NUMERICOID:
-    return_result = JS_NewFloat64(ctx, pljs_numeric_to_double(arg));
+  case NUMERICOID: {
+    double f = pljs_numeric_to_double(arg);
+    if (pljs_preserve_numeric_precision && !isnan(f) && !isinf(f)) {
+      Numeric num_val = DatumGetNumeric(arg);
+      Datum d_from_f = DirectFunctionCall1(float8_numeric, Float8GetDatum(f));
+      bool eq = DatumGetBool(DirectFunctionCall2(
+          numeric_eq, NumericGetDatum(num_val), d_from_f));
+      pfree(DatumGetPointer(d_from_f));
+      if (!eq) {
+        char *nstr = DatumGetCString(
+            DirectFunctionCall1(numeric_out, NumericGetDatum(num_val)));
+        return_result = JS_NewString(ctx, nstr);
+        pfree(nstr);
+        pljs_free_if_detoasted(num_val, arg);
+        break;
+      }
+      pljs_free_if_detoasted(num_val, arg);
+    }
+    return_result = JS_NewFloat64(ctx, f);
     break;
+  }
 
   case TEXTOID:
   case VARCHAROID:
@@ -4871,6 +4917,8 @@ JSValue pljs_values_to_array(JSValue *array, int argc, int start,
 JSValue pljs_tuple_to_jsvalue(TupleDesc tupledesc, HeapTuple heap_tuple,
                               JSContext *ctx) {
   JSValue obj = JS_NewObject(ctx);
+  JSValue numeric_cols = JS_UNDEFINED;
+  uint32_t num_numeric_cols = 0;
 
   /*
    * A column that cannot be converted raises, and pljs.execute() and the
@@ -4894,10 +4942,35 @@ JSValue pljs_tuple_to_jsvalue(TupleDesc tupledesc, HeapTuple heap_tuple,
       pljs_define_column(ctx, obj, tuple_attrs,
                          pljs_datum_to_jsvalue(tuple_attrs->atttypid, datum,
                                                isnull, true, ctx));
+
+      if (pljs_preserve_numeric_precision && !isnull &&
+          pljs_type_base(tuple_attrs->atttypid) == NUMERICOID) {
+        if (JS_IsUndefined(numeric_cols)) {
+          numeric_cols = JS_NewArray(ctx);
+          pljs_checked_value(ctx, numeric_cols);
+        }
+        const char *colname = NameStr(tuple_attrs->attname);
+        JSValue colname_val =
+            pljs_new_server_string(ctx, colname, strlen(colname));
+        pljs_checked_define(
+            ctx, JS_DefinePropertyValueUint32(
+                     ctx, numeric_cols, num_numeric_cols++, colname_val,
+                     JS_PROP_C_W_E));
+      }
+    }
+
+    if (!JS_IsUndefined(numeric_cols)) {
+      pljs_checked_define(ctx, JS_DefinePropertyValueStr(
+                                   ctx, obj, "__numeric_columns", numeric_cols,
+                                   JS_PROP_CONFIGURABLE));
+      numeric_cols = JS_UNDEFINED;
     }
   }
   PG_CATCH();
   {
+    if (!JS_IsUndefined(numeric_cols)) {
+      JS_FreeValue(ctx, numeric_cols);
+    }
     JS_FreeValue(ctx, obj);
     PG_RE_THROW();
   }
@@ -5667,6 +5740,44 @@ static JsonbValue *jsonb_object_from_object(jsonb_build *build,
   build->held[held].tab = tab;
   build->held[held].tab_length = tab_length;
 
+  /*
+   * Rows produced by SPI or composite Datum conversion in
+   * preserve_numeric_precision mode carry a hidden non-enumerable
+   * __numeric_columns array; string values in those columns are exact numeric
+   * text and are emitted as jsonb numbers rather than strings.
+   */
+  JSValue numeric_cols = JS_UNDEFINED;
+  int32_t num_numeric_cols = 0;
+  {
+    JSAtom num_atom = JS_NewAtom(ctx, "__numeric_columns");
+    if (num_atom != JS_ATOM_NULL) {
+      int has_own = JS_GetOwnProperty(ctx, NULL, object, num_atom);
+      if (has_own < 0) {
+        JS_FreeAtom(ctx, num_atom);
+        pljs_ereport_js_exception(ctx);
+      }
+      if (has_own > 0) {
+        JSValue tagval = JS_GetProperty(ctx, object, num_atom);
+        JS_FreeAtom(ctx, num_atom);
+        num_atom = JS_ATOM_NULL;
+        pljs_checked_value(ctx, tagval);
+        if (JS_IsArray(ctx, tagval)) {
+          jsonb_hold(build, tagval);
+          numeric_cols = tagval;
+          num_numeric_cols = pljs_js_array_length(numeric_cols, ctx);
+          if (num_numeric_cols < 0) {
+            pljs_ereport_js_exception(ctx);
+          }
+        } else {
+          JS_FreeValue(ctx, tagval);
+        }
+      }
+      if (num_atom != JS_ATOM_NULL) {
+        JS_FreeAtom(ctx, num_atom);
+      }
+    }
+  }
+
   // Iterate through the `Object` keys.
   for (uint32_t object_key = 0; object_key < tab_length; object_key++) {
     JSAtom atom = tab[object_key].atom;
@@ -5682,19 +5793,89 @@ static JsonbValue *jsonb_object_from_object(jsonb_build *build,
       const char *key = JS_ToCStringLen(ctx, &key_length, key_value);
       JsonbValue key_jsonb;
 
-      JS_FreeValue(ctx, key_value);
-
       if (key == NULL) {
+        JS_FreeValue(ctx, key_value);
         pljs_ereport_js_exception(ctx);
+      }
+
+      bool is_numeric_col = false;
+      if (!JS_IsUndefined(numeric_cols) && JS_IsString(json)) {
+        for (int32_t n = 0; n < num_numeric_cols && !is_numeric_col; n++) {
+          JSValue cn = JS_GetPropertyUint32(ctx, numeric_cols, (uint32_t)n);
+          if (JS_IsException(cn)) {
+            JS_FreeCString(ctx, key);
+            JS_FreeValue(ctx, key_value);
+            pljs_ereport_js_exception(ctx);
+          }
+          if (JS_StrictEq(ctx, cn, key_value)) {
+            is_numeric_col = true;
+          }
+          JS_FreeValue(ctx, cn);
+        }
       }
 
       jsonb_string_value(&key_jsonb, key, key_length, ctx);
       JS_FreeCString(ctx, key);
+      JS_FreeValue(ctx, key_value);
 
       jsonb_push(&build->pstate, WJB_KEY, &key_jsonb);
-      jsonb_from_any(build, json, WJB_VALUE);
+
+      bool emitted_numeric = false;
+      if (is_numeric_col) {
+        size_t slen = 0;
+        const char *s = JS_ToCStringLen(ctx, &slen, json);
+        if (s == NULL) {
+          pljs_ereport_js_exception(ctx);
+        }
+        bool plain = false;
+        size_t idx = 0;
+        if (idx < slen && s[idx] == '-') {
+          idx++;
+        }
+        size_t int_digits = 0;
+        while (idx < slen && s[idx] >= '0' && s[idx] <= '9') {
+          int_digits++;
+          idx++;
+        }
+        if (int_digits > 0) {
+          if (idx == slen) {
+            plain = true;
+          } else if (s[idx] == '.') {
+            idx++;
+            size_t frac_digits = 0;
+            while (idx < slen && s[idx] >= '0' && s[idx] <= '9') {
+              frac_digits++;
+              idx++;
+            }
+            if (frac_digits > 0 && idx == slen) {
+              plain = true;
+            }
+          }
+        }
+        if (plain) {
+          char *num_copy = pstrdup(s);
+          JS_FreeCString(ctx, s);
+          JsonbValue nv;
+          nv.type = jbvNumeric;
+          nv.val.numeric = DatumGetNumeric(DirectFunctionCall3(
+              numeric_in, CStringGetDatum(num_copy),
+              ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+          jsonb_push(&build->pstate, WJB_VALUE, &nv);
+          emitted_numeric = true;
+        } else {
+          JS_FreeCString(ctx, s);
+        }
+      }
+
+      if (!emitted_numeric) {
+        jsonb_from_any(build, json, WJB_VALUE);
+      }
     }
 
+    jsonb_release(build);
+  }
+
+  if (!JS_IsUndefined(numeric_cols)) {
     jsonb_release(build);
   }
 

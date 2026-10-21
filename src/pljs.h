@@ -169,6 +169,7 @@ typedef struct pljs_function_cache_value {
    */
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
+  bool preserve_numeric_precision;
 } pljs_function_cache_value;
 
 typedef struct pljs_param_state {
@@ -239,6 +240,7 @@ typedef struct pljs_func {
 
   int nhandlers;
   pljs_handler_dep handlers[PLJS_MAX_LANG_HANDLER_DEPTH];
+  bool preserve_numeric_precision;
 
   bool trigger;
   bool is_srf;                  // are we a set returning function?
@@ -287,6 +289,7 @@ extern JSClassID js_window_id;
 Datum pljs_call_handler(PG_FUNCTION_ARGS);
 Datum pljs_call_validator(PG_FUNCTION_ARGS);
 Datum pljs_inline_handler(PG_FUNCTION_ARGS);
+extern bool pljs_preserve_numeric_precision;
 
 // Extension initialization
 void _PG_init(void);

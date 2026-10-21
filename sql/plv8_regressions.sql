@@ -135,3 +135,33 @@ $$;
 DROP FUNCTION test_subxact_unique_violation();
 DROP FUNCTION test_custom_js_sqlstate();
 DROP TABLE subxact_err_tbl;
+
+-- preserve_numeric_precision and __numeric_columns jsonb roundtrip
+CREATE FUNCTION num_prec_handler() RETURNS language_handler AS $$
+	if (arguments[1]) arguments[1].preserve_numeric_precision = true;
+	return arguments[0];
+$$ LANGUAGE pljs;
+
+CREATE LANGUAGE num_prec_lang HANDLER num_prec_handler;
+
+CREATE FUNCTION test_num_prec_jsonb() RETURNS jsonb AS $$
+	const rows = pljs.execute("SELECT 12345678901234567890.123456789::numeric AS high_p, 42.5::numeric AS normal_p");
+	return rows[0];
+$$ LANGUAGE num_prec_lang;
+
+SELECT test_num_prec_jsonb();
+
+CREATE FUNCTION test_num_prec_edge_cases() RETURNS jsonb AS $$
+	const o1 = { a: 1 };
+	Object.defineProperty(o1, '__numeric_columns', { value: 'not_an_array', enumerable: false });
+	const o2 = { a: '-.', b: '.', c: '1.', d: '.5', e: '-42.125' };
+	Object.defineProperty(o2, '__numeric_columns', { value: ['a', 'b', 'c', 'd', 'e'], enumerable: false });
+	return { o1, o2 };
+$$ LANGUAGE pljs;
+
+SELECT test_num_prec_edge_cases();
+
+DROP FUNCTION test_num_prec_edge_cases();
+DROP FUNCTION test_num_prec_jsonb();
+DROP LANGUAGE num_prec_lang;
+DROP FUNCTION num_prec_handler();

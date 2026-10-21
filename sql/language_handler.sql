@@ -539,6 +539,19 @@ SELECT super_raw_arr(ARRAY['\x41'::raw_test_type, '\x42'::raw_test_type]);
 SELECT super_raw_comp(ROW('\x41'::raw_test_type, 6)::raw_comp);
 \set VERBOSITY default
 
+CREATE FUNCTION test_proc_cache_key() RETURNS bool AS $$
+  const gen = pljs.proc_cache_key("*");
+  const byName = pljs.proc_cache_key("raw_test_normal_pljs");
+  const oidRow = pljs.execute("SELECT 'raw_test_normal_pljs'::regproc::oid::int AS oid")[0];
+  const byOid = pljs.proc_cache_key(oidRow.oid);
+  return typeof gen === "string" && gen.startsWith("gen:") &&
+         typeof byName === "string" && byName === byOid &&
+         pljs.proc_cache_key(0) === null &&
+         pljs.proc_cache_key("nonexistent_fn_xyz") === null;
+$$ LANGUAGE pljs;
+SELECT test_proc_cache_key();
+
+DROP FUNCTION test_proc_cache_key();
 DROP FUNCTION super_raw_comp(raw_comp);
 DROP TYPE raw_comp;
 DROP FUNCTION super_raw_arr(raw_test_type[]);

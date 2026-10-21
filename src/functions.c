@@ -523,6 +523,8 @@ void pljs_setup_namespace(JSContext *ctx) {
    * kept the context: one a start_proc failed in could not be freed.
    */
   JS_FreeValue(ctx, global_obj);
+
+  pljs_fdw_bootstrap_js(ctx);
 }
 
 /**

@@ -297,6 +297,11 @@ Datum pljs_source_out(PG_FUNCTION_ARGS);
 Datum pljs_call_support(PG_FUNCTION_ARGS);
 Datum pljs_base_type_in(PG_FUNCTION_ARGS);
 Datum pljs_base_type_out(PG_FUNCTION_ARGS);
+Datum pljs_fdw_handler(PG_FUNCTION_ARGS);
+Datum pljs_fdw_validator(PG_FUNCTION_ARGS);
+void pljs_fdw_bootstrap_js(JSContext *ctx);
+void pljs_fdw_context_reset(JSContext *ctx);
+void pljs_fdw_xact_cb(XactEvent event, void *arg);
 
 typedef struct pljs_inferred_col {
   char name[NAMEDATALEN];

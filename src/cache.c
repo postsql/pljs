@@ -94,6 +94,7 @@ static void pljs_cleanup_context(pljs_context_cache_value *cache_entry) {
   JSValue pljs = JS_GetPropertyStr(ctx, global_obj, "pljs");
 
   pljs_support_free_context_callbacks(ctx);
+  pljs_fdw_context_reset(ctx);
 
   /* Free all cached function JSValues for this context. */
   if (cache_entry->function_hash_table != NULL) {
@@ -285,6 +286,7 @@ void pljs_cache_reset(void) {
                 (pljs_context_cache_value *)hash_seq_search(&status)) != NULL) {
       if (ctx_hvalue->ctx != NULL) {
         pljs_support_free_context_callbacks(ctx_hvalue->ctx);
+        pljs_fdw_context_reset(ctx_hvalue->ctx);
       }
 
       if (ctx_hvalue->function_hash_table != NULL) {

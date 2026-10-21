@@ -63,7 +63,7 @@ PG_FUNCTION_INFO_V1(pljs_fdw_handler);
 
 /*
  * Embedded JavaScript Bootstrap for ForeignDataWrapper and Reference Wrappers
- * (ArrayTableFdw, MapTableFdw).
+ * (ArrayTableFdw, MapTableFdw, TempTableFdw, RandomPeopleFdw).
  * Exposed on globalThis, globalThis.pljs, and globalThis.plv8.
  */
 static const char *pljs_fdw_bootstrap_code =
@@ -400,18 +400,275 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "  }\n"
     "\n"
+    "  class TempTableFdw extends ForeignDataWrapper {\n"
+    "    constructor(options = {}) {\n"
+    "      super(options);\n"
+    "      this.isKeyIndexed = true;\n"
+    "      this.keyColumn = (options && (options.pk || options.key || options.rowid_column)) || 'id';\n"
+    "      this.map = new Map();\n"
+    "      this._txBackup = null;\n"
+    "    }\n"
+    "    _cloneMap() {\n"
+    "      const m = new Map();\n"
+    "      for (const [k, v] of this.map.entries()) {\n"
+    "        m.set(k, Object.assign({}, v));\n"
+    "      }\n"
+    "      return m;\n"
+    "    }\n"
+    "    _ensureBackup() {\n"
+    "      if (this._txBackup === null) {\n"
+    "        this._txBackup = this._cloneMap();\n"
+    "      }\n"
+    "    }\n"
+    "    _normKey(val) {\n"
+    "      return val === null || val === undefined ? '' : String(val);\n"
+    "    }\n"
+    "    getRelSize(planContext) {\n"
+    "      const hasKeyEq = planContext && Array.isArray(planContext.quals) &&\n"
+    "        planContext.quals.some(q => q.column === this.keyColumn && (q.op === '=' || q.op === 'IN'));\n"
+    "      if (hasKeyEq) {\n"
+    "        return { rows: 1, width: 64, startupCost: 0.05, totalCost: 0.5 };\n"
+    "      }\n"
+    "      const n = this.map.size || 1;\n"
+    "      return { rows: n, width: 64, startupCost: 0.5, totalCost: 0.5 + n * 0.1 };\n"
+    "    }\n"
+    "    getPathKeys(planContext) {\n"
+    "      return [{ column: this.keyColumn, ascending: true, nullsFirst: false }];\n"
+    "    }\n"
+    "    lookupKey(key, request) {\n"
+    "      const k = this._normKey(key);\n"
+    "      if (!this.map.has(k)) return [];\n"
+    "      const row = this.map.get(k);\n"
+    "      const filters = (request && request.filters) || [];\n"
+    "      if (!ForeignDataWrapper.matchFilters(row, filters)) return [];\n"
+    "      const cols = (request && request.columns) || null;\n"
+    "      const out = ForeignDataWrapper.projectRow(row, cols);\n"
+    "      out.__rowid = row[this.keyColumn];\n"
+    "      return [out];\n"
+    "    }\n"
+    "    *scan(request) {\n"
+    "      const filters = (request && request.filters) || [];\n"
+    "      const keys = (request && request.keys) || null;\n"
+    "      const cols = (request && request.columns) || null;\n"
+    "      const lim = (request && typeof request.limit === 'number' && request.limit >= 0) ? request.limit : -1;\n"
+    "      let count = 0;\n"
+    "      if (keys && keys.length > 0) {\n"
+    "        for (let i = 0; i < keys.length; i++) {\n"
+    "          if (lim >= 0 && count >= lim) break;\n"
+    "          const found = this.lookupKey(keys[i], request);\n"
+    "          for (let j = 0; j < found.length; j++) {\n"
+    "            if (lim >= 0 && count >= lim) break;\n"
+    "            count++;\n"
+    "            yield found[j];\n"
+    "          }\n"
+    "        }\n"
+    "        return;\n"
+    "      }\n"
+    "      for (const [, row] of this.map.entries()) {\n"
+    "        if (lim >= 0 && count >= lim) break;\n"
+    "        if (ForeignDataWrapper.matchFilters(row, filters)) {\n"
+    "          count++;\n"
+    "          const out = ForeignDataWrapper.projectRow(row, cols);\n"
+    "          out.__rowid = row[this.keyColumn];\n"
+    "          yield out;\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    insert(row) {\n"
+    "      this._ensureBackup();\n"
+    "      const k = this._normKey(row[this.keyColumn]);\n"
+    "      if (!k) throw new Error('TempTableFdw: primary key column \"' + this.keyColumn + '\" cannot be null');\n"
+    "      const copy = Object.assign({}, row);\n"
+    "      this.map.set(k, copy);\n"
+    "      return copy;\n"
+    "    }\n"
+    "    update(rowid, newRow) {\n"
+    "      this._ensureBackup();\n"
+    "      const oldK = this._normKey(rowid);\n"
+    "      const existing = this.map.get(oldK) || {};\n"
+    "      const merged = Object.assign({}, existing);\n"
+    "      for (const prop of Object.keys(newRow)) {\n"
+    "        if (newRow[prop] !== undefined) {\n"
+    "          merged[prop] = newRow[prop];\n"
+    "        }\n"
+    "      }\n"
+    "      const newK = merged[this.keyColumn] !== undefined && merged[this.keyColumn] !== null\n"
+    "        ? this._normKey(merged[this.keyColumn])\n"
+    "        : oldK;\n"
+    "      if (newK !== oldK) this.map.delete(oldK);\n"
+    "      this.map.set(newK, merged);\n"
+    "      return merged;\n"
+    "    }\n"
+    "    delete(rowid) {\n"
+    "      this._ensureBackup();\n"
+    "      const k = this._normKey(rowid);\n"
+    "      const existing = this.map.get(k) || null;\n"
+    "      this.map.delete(k);\n"
+    "      return existing;\n"
+    "    }\n"
+    "    canDirectModify(operation, quals) {\n"
+    "      return operation === 'DELETE' || operation === 'UPDATE';\n"
+    "    }\n"
+    "    directModify(operation, quals, updates) {\n"
+    "      this._ensureBackup();\n"
+    "      let affected = 0;\n"
+    "      const toDelete = [];\n"
+    "      const toUpdate = [];\n"
+    "      for (const [k, row] of this.map.entries()) {\n"
+    "        if (ForeignDataWrapper.matchFilters(row, quals)) {\n"
+    "          if (operation === 'DELETE') {\n"
+    "            toDelete.push(k);\n"
+    "          } else if (operation === 'UPDATE') {\n"
+    "            toUpdate.push([k, Object.assign({}, row, updates || {})]);\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "      for (let i = 0; i < toDelete.length; i++) {\n"
+    "        this.map.delete(toDelete[i]);\n"
+    "        affected++;\n"
+    "      }\n"
+    "      for (let i = 0; i < toUpdate.length; i++) {\n"
+    "        const [k, updated] = toUpdate[i];\n"
+    "        this.map.set(k, updated);\n"
+    "        affected++;\n"
+    "      }\n"
+    "      return affected;\n"
+    "    }\n"
+    "    commit() {\n"
+    "      this._txBackup = null;\n"
+    "    }\n"
+    "    rollback() {\n"
+    "      if (this._txBackup !== null) {\n"
+    "        this.map = this._txBackup;\n"
+    "        this._txBackup = null;\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "\n"
+    "  class RandomPeopleFdw extends ForeignDataWrapper {\n"
+    "    constructor(options = {}) {\n"
+    "      super(options);\n"
+    "      this.isKeyIndexed = true;\n"
+    "      this.keyColumn = 'id';\n"
+    "      this.seed = (options && options.seed !== undefined) ? (Number(options.seed) || 0) : 0;\n"
+    "      this.defaultLimit = (options && options.limit !== undefined) ? Number(options.limit) : 1000;\n"
+    "    }\n"
+    "    static get FIRST_NAMES() {\n"
+    "      return [\n"
+    "        'James', 'Mary', 'John', 'Patricia', 'Robert', 'Jennifer', 'Michael', 'Linda',\n"
+    "        'William', 'Elizabeth', 'David', 'Barbara', 'Richard', 'Susan', 'Joseph', 'Jessica',\n"
+    "        'Thomas', 'Sarah', 'Charles', 'Karen', 'Christopher', 'Nancy', 'Daniel', 'Lisa',\n"
+    "        'Matthew', 'Betty', 'Anthony', 'Margaret', 'Mark', 'Sandra'\n"
+    "      ];\n"
+    "    }\n"
+    "    static get LAST_NAMES() {\n"
+    "      return [\n"
+    "        'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis',\n"
+    "        'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Gonzalez', 'Wilson', 'Anderson',\n"
+    "        'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Perez', 'Thompson', 'White'\n"
+    "      ];\n"
+    "    }\n"
+    "    static get CITIES() {\n"
+    "      return [\n"
+    "        'New York', 'Los Angeles', 'Chicago', 'Houston', 'Phoenix', 'Philadelphia',\n"
+    "        'San Antonio', 'San Diego', 'Dallas', 'San Jose', 'Austin', 'Jacksonville',\n"
+    "        'Fort Worth', 'Columbus', 'Charlotte', 'San Francisco', 'Indianapolis', 'Seattle'\n"
+    "      ];\n"
+    "    }\n"
+    "    _generatePerson(id) {\n"
+    "      let a = ((id + this.seed) * 1664525 + 1013904223) >>> 0;\n"
+    "      const nextRand = () => {\n"
+    "        a = (a + 0x6D2B79F5) >>> 0;\n"
+    "        let t = Math.imul(a ^ (a >>> 15), 1 | a);\n"
+    "        t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);\n"
+    "        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;\n"
+    "      };\n"
+    "      const fns = RandomPeopleFdw.FIRST_NAMES;\n"
+    "      const lns = RandomPeopleFdw.LAST_NAMES;\n"
+    "      const cities = RandomPeopleFdw.CITIES;\n"
+    "      const fn = fns[Math.floor(nextRand() * fns.length)];\n"
+    "      const ln = lns[Math.floor(nextRand() * lns.length)];\n"
+    "      const city = cities[Math.floor(nextRand() * cities.length)];\n"
+    "      const age = 18 + Math.floor(nextRand() * 65);\n"
+    "      const email = fn.toLowerCase() + '.' + ln.toLowerCase() + id + '@example.com';\n"
+    "      return {\n"
+    "        id: id,\n"
+    "        first_name: fn,\n"
+    "        last_name: ln,\n"
+    "        email: email,\n"
+    "        age: age,\n"
+    "        city: city,\n"
+    "        __rowid: id\n"
+    "      };\n"
+    "    }\n"
+    "    getRelSize(planContext) {\n"
+    "      const hasKeyEq = planContext && Array.isArray(planContext.quals) &&\n"
+    "        planContext.quals.some(q => q.column === 'id' && q.op === '=');\n"
+    "      if (hasKeyEq) {\n"
+    "        return { rows: 1, width: 72, startupCost: 0.05, totalCost: 0.5 };\n"
+    "      }\n"
+    "      const n = (planContext && typeof planContext.limit === 'number' && planContext.limit >= 0)\n"
+    "        ? Math.min(planContext.limit, this.defaultLimit)\n"
+    "        : this.defaultLimit;\n"
+    "      return { rows: Math.max(1, n), width: 72, startupCost: 0.5, totalCost: 0.5 + Math.max(1, n) * 0.05 };\n"
+    "    }\n"
+    "    lookupKey(key, request) {\n"
+    "      const id = Number(key);\n"
+    "      if (!Number.isInteger(id) || id < 1 || id > this.defaultLimit) return [];\n"
+    "      const row = this._generatePerson(id);\n"
+    "      const cols = (request && request.columns) || null;\n"
+    "      return [ForeignDataWrapper.projectRow(row, cols)];\n"
+    "    }\n"
+    "    *scan(request) {\n"
+    "      const filters = (request && request.filters) || [];\n"
+    "      const keys = (request && request.keys) || null;\n"
+    "      const cols = (request && request.columns) || null;\n"
+    "      const hasPushedLimit = (request && typeof request.limit === 'number' && request.limit >= 0);\n"
+    "      const targetCount = hasPushedLimit ? Math.min(request.limit, this.defaultLimit) : this.defaultLimit;\n"
+    "      if (targetCount <= 0) return;\n"
+    "      let emitted = 0;\n"
+    "      if (keys && keys.length > 0) {\n"
+    "        const uniqueIds = Array.from(new Set(keys.map(v => Number(v)))).sort((a, b) => a - b);\n"
+    "        for (let i = 0; i < uniqueIds.length; i++) {\n"
+    "          if (emitted >= targetCount) break;\n"
+    "          const found = this.lookupKey(uniqueIds[i], request);\n"
+    "          for (let j = 0; j < found.length; j++) {\n"
+    "            if (emitted >= targetCount) break;\n"
+    "            emitted++;\n"
+    "            yield found[j];\n"
+    "          }\n"
+    "        }\n"
+    "        return;\n"
+    "      }\n"
+    "      for (let id = 1; id <= this.defaultLimit; id++) {\n"
+    "        if (emitted >= targetCount) break;\n"
+    "        const row = this._generatePerson(id);\n"
+    "        if (ForeignDataWrapper.matchFilters(row, filters)) {\n"
+    "          emitted++;\n"
+    "          yield ForeignDataWrapper.projectRow(row, cols);\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "\n"
     "  global.ForeignDataWrapper = ForeignDataWrapper;\n"
     "  global.ArrayTableFdw = ArrayTableFdw;\n"
     "  global.MapTableFdw = MapTableFdw;\n"
+    "  global.TempTableFdw = TempTableFdw;\n"
+    "  global.RandomPeopleFdw = RandomPeopleFdw;\n"
     "  if (global.pljs) {\n"
     "    global.pljs.ForeignDataWrapper = ForeignDataWrapper;\n"
     "    global.pljs.ArrayTableFdw = ArrayTableFdw;\n"
     "    global.pljs.MapTableFdw = MapTableFdw;\n"
+    "    global.pljs.TempTableFdw = TempTableFdw;\n"
+    "    global.pljs.RandomPeopleFdw = RandomPeopleFdw;\n"
     "  }\n"
     "  if (global.plv8) {\n"
     "    global.plv8.ForeignDataWrapper = ForeignDataWrapper;\n"
     "    global.plv8.ArrayTableFdw = ArrayTableFdw;\n"
     "    global.plv8.MapTableFdw = MapTableFdw;\n"
+    "    global.plv8.TempTableFdw = TempTableFdw;\n"
+    "    global.plv8.RandomPeopleFdw = RandomPeopleFdw;\n"
     "  }\n"
     "})(globalThis);\n";
 
@@ -729,6 +986,7 @@ typedef struct PljsFdwPlanState {
   PljsQual *pushed_quals;
   int orderby_count;
   PljsOrderBy *orderby;
+  int64 pushed_limit;
 } PljsFdwPlanState;
 
 typedef struct PljsCacheEntry {
@@ -765,6 +1023,8 @@ typedef struct PljsFdwScanState {
   PljsOrderBy *orderby;
   int proj_cols_count;
   char **proj_cols;
+  int64 pushed_limit;
+  int64 emitted_rows;
 
   bool cache_results;
   int cache_max_entries;
@@ -1145,6 +1405,7 @@ static void pljs_fdw_get_foreign_rel_size(PlannerInfo *root,
   fpinfo->cache_results = true;
   fpinfo->cache_size = 64;
   fpinfo->cache_memory_limit = 16LL * 1024LL * 1024LL;
+  fpinfo->pushed_limit = -1;
 
   PljsFdwOptions opts;
   pljs_fdw_get_options(foreigntableid, &opts);
@@ -1170,9 +1431,14 @@ static void pljs_fdw_get_foreign_rel_size(PlannerInfo *root,
   if (opt_key && opt_key[0] != '\0') {
     fpinfo->key_column = pstrdup(opt_key);
   } else {
-    const char *opt_rc = pljs_fdw_opt_get(&opts, "rowid_column");
-    if (opt_rc && opt_rc[0] != '\0') {
-      fpinfo->key_column = pstrdup(opt_rc);
+    const char *opt_pk = pljs_fdw_opt_get(&opts, "pk");
+    if (opt_pk && opt_pk[0] != '\0') {
+      fpinfo->key_column = pstrdup(opt_pk);
+    } else {
+      const char *opt_rc = pljs_fdw_opt_get(&opts, "rowid_column");
+      if (opt_rc && opt_rc[0] != '\0') {
+        fpinfo->key_column = pstrdup(opt_rc);
+      }
     }
   }
 
@@ -1197,6 +1463,39 @@ static void pljs_fdw_get_foreign_rel_size(PlannerInfo *root,
   }
 
   table_close(rel, NoLock);
+
+  if (root->parse && list_length(root->parse->rtable) == 1 &&
+      root->parse->jointree && list_length(root->parse->jointree->fromlist) == 1 &&
+      root->parse->jointree->quals == NULL && !root->parse->hasAggs &&
+      root->parse->groupClause == NIL && root->parse->distinctClause == NIL &&
+      root->parse->havingQual == NULL && root->parse->limitCount != NULL &&
+      IsA(root->parse->limitCount, Const)) {
+    Const *lim_const = (Const *)root->parse->limitCount;
+    int64 lim_val = -1;
+    if (!lim_const->constisnull) {
+      if (lim_const->consttype == INT8OID)
+        lim_val = DatumGetInt64(lim_const->constvalue);
+      else if (lim_const->consttype == INT4OID)
+        lim_val = (int64)DatumGetInt32(lim_const->constvalue);
+    }
+    int64 off_val = 0;
+    if (root->parse->limitOffset != NULL) {
+      if (IsA(root->parse->limitOffset, Const)) {
+        Const *off_const = (Const *)root->parse->limitOffset;
+        if (!off_const->constisnull) {
+          if (off_const->consttype == INT8OID)
+            off_val = DatumGetInt64(off_const->constvalue);
+          else if (off_const->consttype == INT4OID)
+            off_val = (int64)DatumGetInt32(off_const->constvalue);
+        }
+      } else {
+        lim_val = -1;
+      }
+    }
+    if (lim_val >= 0 && off_val >= 0) {
+      fpinfo->pushed_limit = lim_val + off_val;
+    }
+  }
 
   double rows = 1000.0;
   int width = 64;
@@ -1245,6 +1544,10 @@ static void pljs_fdw_get_foreign_rel_size(PlannerInfo *root,
                                                  NULL));
       }
       JS_SetPropertyStr(ctx, plan_ctx, "quals", quals_arr);
+      if (fpinfo->pushed_limit >= 0) {
+        JS_SetPropertyStr(ctx, plan_ctx, "limit",
+                          JS_NewFloat64(ctx, (double)fpinfo->pushed_limit));
+      }
 
       JSValue args[1] = {plan_ctx};
       JS_UpdateStackTop(JS_GetRuntime(ctx));
@@ -1448,6 +1751,10 @@ static void pljs_fdw_get_foreign_paths(PlannerInfo *root, RelOptInfo *baserel,
         }
       }
       JS_SetPropertyStr(ctx, plan_ctx, "quals", quals_arr);
+      if (fpinfo && fpinfo->pushed_limit >= 0) {
+        JS_SetPropertyStr(ctx, plan_ctx, "limit",
+                          JS_NewFloat64(ctx, (double)fpinfo->pushed_limit));
+      }
 
       JSValue args[1] = {plan_ctx};
       JS_UpdateStackTop(JS_GetRuntime(ctx));
@@ -1608,7 +1915,39 @@ static ForeignScan *pljs_fdw_get_foreign_plan(PlannerInfo *root,
 
   table_close(rel, NoLock);
 
-  List *fdw_private = NIL;
+  int64 pushed_lim = (fpinfo != NULL) ? fpinfo->pushed_limit : -1;
+  if (pushed_lim < 0) {
+    if (root->limit_tuples > 0.0 && root->limit_tuples < 1e12) {
+      pushed_lim = (int64)ceil(root->limit_tuples);
+    } else if (root->parse && root->parse->limitCount &&
+               IsA(root->parse->limitCount, Const) &&
+               !((Const *)root->parse->limitCount)->constisnull) {
+      Const *lc_const = (Const *)root->parse->limitCount;
+      pushed_lim = (lc_const->consttype == INT4OID)
+                       ? (int64)DatumGetInt32(lc_const->constvalue)
+                       : DatumGetInt64(lc_const->constvalue);
+      if (root->parse->limitOffset && IsA(root->parse->limitOffset, Const) &&
+          !((Const *)root->parse->limitOffset)->constisnull) {
+        Const *lo_const = (Const *)root->parse->limitOffset;
+        pushed_lim += (lo_const->consttype == INT4OID)
+                          ? (int64)DatumGetInt32(lo_const->constvalue)
+                          : DatumGetInt64(lo_const->constvalue);
+      }
+    }
+  }
+
+  bool has_sort_needed = false;
+  if (root->sort_pathkeys != NIL) {
+    if (!best_path->path.pathkeys ||
+        !pathkeys_contained_in(root->sort_pathkeys, best_path->path.pathkeys)) {
+      has_sort_needed = true;
+    }
+  }
+  if (has_sort_needed || local_exprs != NIL) {
+    pushed_lim = -1;
+  }
+
+  List *fdw_private = list_make1(makeInteger((int)pushed_lim));
   if (best_path->fdw_private != NIL && fpinfo != NULL &&
       fpinfo->orderby_count > 0) {
     List *ob_list = NIL;
@@ -1619,7 +1958,7 @@ static ForeignScan *pljs_fdw_get_foreign_plan(PlannerInfo *root,
                               makeInteger(ob->nulls_first ? 1 : 0));
       ob_list = lappend(ob_list, item);
     }
-    fdw_private = list_make1(ob_list);
+    fdw_private = lappend(fdw_private, ob_list);
   }
 
   return make_foreignscan(tlist, local_exprs, scan_relid, fdw_exprs,
@@ -1661,6 +2000,8 @@ static void pljs_fdw_begin_foreign_scan(ForeignScanState *node, int eflags) {
   festate->key_column = pstrdup("key");
   festate->rowid_column = pstrdup("id");
   festate->rowid_attno = InvalidAttrNumber;
+  festate->pushed_limit = -1;
+  festate->emitted_rows = 0;
   festate->cache_results = true;
   festate->cache_max_entries = 64;
   festate->cache_max_bytes = 16LL * 1024LL * 1024LL;
@@ -1696,10 +2037,17 @@ static void pljs_fdw_begin_foreign_scan(ForeignScanState *node, int eflags) {
     festate->rowid_column = pstrdup(opt_rc);
     festate->key_column = pstrdup(opt_rc);
   }
+  const char *opt_pk = pljs_fdw_opt_get(&opts, "pk");
+  if (opt_pk && opt_pk[0] != '\0') {
+    festate->key_column = pstrdup(opt_pk);
+    if (!opt_rc) {
+      festate->rowid_column = pstrdup(opt_pk);
+    }
+  }
   const char *opt_key = pljs_fdw_opt_get(&opts, "key");
   if (opt_key && opt_key[0] != '\0') {
     festate->key_column = pstrdup(opt_key);
-    if (!opt_rc) {
+    if (!opt_rc && !opt_pk) {
       festate->rowid_column = pstrdup(opt_key);
     }
   }
@@ -1791,7 +2139,13 @@ static void pljs_fdw_begin_foreign_scan(ForeignScanState *node, int eflags) {
 
   if (fsplan->fdw_private != NIL) {
     if (list_length(fsplan->fdw_private) >= 1) {
-      List *ob_list = (List *)linitial(fsplan->fdw_private);
+      Node *lim_node = (Node *)linitial(fsplan->fdw_private);
+      if (lim_node && IsA(lim_node, Integer)) {
+        festate->pushed_limit = (int64)intVal(lim_node);
+      }
+    }
+    if (list_length(fsplan->fdw_private) >= 2) {
+      List *ob_list = (List *)lsecond(fsplan->fdw_private);
       int n_ob = list_length(ob_list);
       if (n_ob > 0) {
         festate->orderby =
@@ -1925,6 +2279,11 @@ static JSValue pljs_fdw_build_scan_request(JSContext *ctx,
   }
   JS_SetPropertyStr(ctx, req, "orderBy", ob_arr);
 
+  if (festate->pushed_limit >= 0) {
+    JS_SetPropertyStr(ctx, req, "limit",
+                      JS_NewFloat64(ctx, (double)festate->pushed_limit));
+  }
+
   *out_keys = keys_arr;
   *out_use_lookup = (festate->is_key_indexed && k_idx > 0);
   return req;
@@ -1941,6 +2300,7 @@ static void pljs_fdw_start_js_scan(JSContext *ctx, PljsFdwScanState *festate,
   festate->eof_reached = false;
   festate->row_idx = 0;
   festate->row_count = 0;
+  festate->emitted_rows = 0;
   festate->is_generator = false;
   festate->is_array = false;
   festate->is_func = false;
@@ -2190,13 +2550,27 @@ static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
     return ExecClearTuple(slot);
 
   if (festate->reading_from_tuplestore && festate->tuplestore != NULL) {
+    if (festate->pushed_limit >= 0 &&
+        festate->emitted_rows >= festate->pushed_limit) {
+      return ExecClearTuple(slot);
+    }
     if (tuplestore_gettupleslot(festate->tuplestore, true, false, slot)) {
+      festate->emitted_rows++;
       return slot;
     }
     return ExecClearTuple(slot);
   }
 
   if (festate->eof_reached) {
+    return ExecClearTuple(slot);
+  }
+
+  if (festate->pushed_limit >= 0 &&
+      festate->emitted_rows >= festate->pushed_limit) {
+    festate->eof_reached = true;
+    if (festate->active_cache_entry != NULL) {
+      festate->active_cache_entry->complete = true;
+    }
     return ExecClearTuple(slot);
   }
 
@@ -2225,9 +2599,11 @@ static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
           festate->tuplestore = found->store;
           tuplestore_rescan(festate->tuplestore);
           festate->reading_from_tuplestore = true;
+          festate->emitted_rows = 0;
           festate->stats_cache_hits++;
           pfree(param_key);
           if (tuplestore_gettupleslot(festate->tuplestore, true, false, slot)) {
+            festate->emitted_rows++;
             ret_slot = slot;
           } else {
             ret_slot = ExecClearTuple(slot);
@@ -2339,6 +2715,7 @@ static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
       } else {
         pljs_fdw_row_to_slot(ctx, row_val, slot, festate);
         JS_FreeValue(ctx, row_val);
+        festate->emitted_rows++;
 
         if (festate->cache_results && festate->tuplestore != NULL) {
           MemoryContext ts_old = MemoryContextSwitchTo(festate->scan_mcxt);
@@ -2388,6 +2765,7 @@ static void pljs_fdw_rescan_foreign_scan(ForeignScanState *node) {
         festate->tuplestore != NULL) {
       tuplestore_rescan(festate->tuplestore);
       festate->reading_from_tuplestore = true;
+      festate->emitted_rows = 0;
       festate->stats_cache_hits++;
       return;
     }
@@ -2410,6 +2788,7 @@ static void pljs_fdw_rescan_foreign_scan(ForeignScanState *node) {
     tuplestore_rescan(festate->tuplestore);
     festate->reading_from_tuplestore = true;
     festate->eof_reached = false;
+    festate->emitted_rows = 0;
     festate->stats_cache_hits++;
     pfree(param_key);
     return;
@@ -2437,6 +2816,7 @@ static void pljs_fdw_rescan_foreign_scan(ForeignScanState *node) {
   festate->reading_from_tuplestore = false;
   festate->scan_started = false;
   festate->eof_reached = false;
+  festate->emitted_rows = 0;
 
   pfree(param_key);
 }
@@ -2495,6 +2875,9 @@ static void pljs_fdw_add_foreign_update_targets(PlannerInfo *root,
   const char *rowid_col = pljs_fdw_opt_get(&opts, "rowid_column");
   if (!rowid_col || rowid_col[0] == '\0') {
     rowid_col = pljs_fdw_opt_get(&opts, "key");
+  }
+  if (!rowid_col || rowid_col[0] == '\0') {
+    rowid_col = pljs_fdw_opt_get(&opts, "pk");
   }
 
   TupleDesc tupdesc = RelationGetDescr(target_relation);
@@ -2599,9 +2982,14 @@ static void pljs_fdw_begin_foreign_modify(ModifyTableState *mtstate,
   if (opt_rc && opt_rc[0] != '\0') {
     fmstate->rowid_column = pstrdup(opt_rc);
   } else {
-    const char *opt_key = pljs_fdw_opt_get(&opts, "key");
-    if (opt_key && opt_key[0] != '\0') {
-      fmstate->rowid_column = pstrdup(opt_key);
+    const char *opt_pk = pljs_fdw_opt_get(&opts, "pk");
+    if (opt_pk && opt_pk[0] != '\0') {
+      fmstate->rowid_column = pstrdup(opt_pk);
+    } else {
+      const char *opt_key = pljs_fdw_opt_get(&opts, "key");
+      if (opt_key && opt_key[0] != '\0') {
+        fmstate->rowid_column = pstrdup(opt_key);
+      }
     }
   }
 
@@ -3143,6 +3531,18 @@ static void pljs_fdw_end_direct_modify(ForeignScanState *node) {
 
 static void pljs_fdw_explain_foreign_scan(ForeignScanState *node,
                                           ExplainState *es) {
+  ForeignScan *plan = (ForeignScan *)node->ss.ps.plan;
+  if (plan && plan->fdw_private != NIL &&
+      list_length(plan->fdw_private) >= 1) {
+    Node *n = (Node *)linitial(plan->fdw_private);
+    if (n && IsA(n, Integer)) {
+      int64 lim = (int64)intVal(n);
+      if (lim >= 0) {
+        ExplainPropertyInteger("Pushed Limit", NULL, lim, es);
+      }
+    }
+  }
+
   PljsFdwScanState *festate = (PljsFdwScanState *)node->fdw_state;
   if (!festate)
     return;
@@ -3194,7 +3594,8 @@ Datum pljs_fdw_validator(PG_FUNCTION_ARGS) {
 
   static const char *valid_opts[] = {
       "wrapper",       "cache_results", "cache_size", "cache_memory_limit",
-      "rowid_column",  "batch_size",    "key",        "direct_modify",
+      "rowid_column",  "batch_size",    "key",        "pk",
+      "seed",          "limit",         "direct_modify",
       NULL};
 
   List *options = untransformRelOptions((Datum)PointerGetDatum(array));

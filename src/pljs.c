@@ -242,6 +242,7 @@ static void pljs_catalog_subxact_cb(SubXactEvent event,
   if (event == SUBXACT_EVENT_ABORT_SUB) {
     pljs_catalog_gen++;
   }
+  pljs_fdw_subxact_cb(event, mySubid, parentSubid, arg);
 }
 
 /**

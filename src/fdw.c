@@ -127,6 +127,9 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "    commit() {}\n"
     "    rollback() {}\n"
+    "    subxactStart(mySubid, parentSubid) {}\n"
+    "    subxactCommit(mySubid, parentSubid) {}\n"
+    "    subxactAbort(mySubid, parentSubid) {}\n"
     "    static matchFilter(row, f) {\n"
     "      const v = row[f.column];\n"
     "      switch (f.op) {\n"
@@ -183,6 +186,7 @@ static const char *pljs_fdw_bootstrap_code =
     "      this.isKeyIndexed = false;\n"
     "      this.rows = ArrayTableFdw.defaultRows();\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    static defaultRows() {\n"
     "      return [\n"
@@ -200,6 +204,12 @@ static const char *pljs_fdw_bootstrap_code =
     "    _ensureBackup() {\n"
     "      if (this._txBackup === null) {\n"
     "        this._txBackup = this._cloneRows();\n"
+    "      }\n"
+    "      if (this._subxactStack.length > 0) {\n"
+    "        const top = this._subxactStack[this._subxactStack.length - 1];\n"
+    "        if (top.snapshot === null) {\n"
+    "          top.snapshot = this._cloneRows();\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "    getRelSize(planContext) {\n"
@@ -252,11 +262,44 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "    commit() {\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    rollback() {\n"
     "      if (this._txBackup !== null) {\n"
     "        this.rows = this._txBackup;\n"
     "        this._txBackup = null;\n"
+    "      }\n"
+    "      this._subxactStack = [];\n"
+    "    }\n"
+    "    subxactStart(mySubid, parentSubid) {\n"
+    "      this._subxactStack.push({ subid: mySubid, parentSubid: parentSubid, snapshot: null });\n"
+    "    }\n"
+    "    subxactCommit(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        const entry = this._subxactStack.splice(idx, 1)[0];\n"
+    "        if (entry.snapshot !== null && idx > 0) {\n"
+    "          const parent = this._subxactStack[idx - 1];\n"
+    "          if (parent.snapshot === null) {\n"
+    "            parent.snapshot = entry.snapshot;\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    subxactAbort(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        let restoreRows = null;\n"
+    "        for (let i = idx; i < this._subxactStack.length; i++) {\n"
+    "          if (this._subxactStack[i].snapshot !== null) {\n"
+    "            restoreRows = this._subxactStack[i].snapshot;\n"
+    "            break;\n"
+    "          }\n"
+    "        }\n"
+    "        this._subxactStack.length = idx;\n"
+    "        if (restoreRows !== null) {\n"
+    "          this.rows = restoreRows;\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -268,6 +311,7 @@ static const char *pljs_fdw_bootstrap_code =
     "      this.keyColumn = (options && options.key) || (options && options.rowid_column) || 'key';\n"
     "      this.map = MapTableFdw.defaultMap();\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    static defaultMap() {\n"
     "      const m = new Map();\n"
@@ -287,6 +331,12 @@ static const char *pljs_fdw_bootstrap_code =
     "    _ensureBackup() {\n"
     "      if (this._txBackup === null) {\n"
     "        this._txBackup = this._cloneMap();\n"
+    "      }\n"
+    "      if (this._subxactStack.length > 0) {\n"
+    "        const top = this._subxactStack[this._subxactStack.length - 1];\n"
+    "        if (top.snapshot === null) {\n"
+    "          top.snapshot = this._cloneMap();\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "    getRelSize(planContext) {\n"
@@ -391,11 +441,44 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "    commit() {\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    rollback() {\n"
     "      if (this._txBackup !== null) {\n"
     "        this.map = this._txBackup;\n"
     "        this._txBackup = null;\n"
+    "      }\n"
+    "      this._subxactStack = [];\n"
+    "    }\n"
+    "    subxactStart(mySubid, parentSubid) {\n"
+    "      this._subxactStack.push({ subid: mySubid, parentSubid: parentSubid, snapshot: null });\n"
+    "    }\n"
+    "    subxactCommit(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        const entry = this._subxactStack.splice(idx, 1)[0];\n"
+    "        if (entry.snapshot !== null && idx > 0) {\n"
+    "          const parent = this._subxactStack[idx - 1];\n"
+    "          if (parent.snapshot === null) {\n"
+    "            parent.snapshot = entry.snapshot;\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    subxactAbort(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        let restoreMap = null;\n"
+    "        for (let i = idx; i < this._subxactStack.length; i++) {\n"
+    "          if (this._subxactStack[i].snapshot !== null) {\n"
+    "            restoreMap = this._subxactStack[i].snapshot;\n"
+    "            break;\n"
+    "          }\n"
+    "        }\n"
+    "        this._subxactStack.length = idx;\n"
+    "        if (restoreMap !== null) {\n"
+    "          this.map = restoreMap;\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -407,6 +490,7 @@ static const char *pljs_fdw_bootstrap_code =
     "      this.keyColumn = (options && (options.pk || options.key || options.rowid_column)) || 'id';\n"
     "      this.map = new Map();\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    _cloneMap() {\n"
     "      const m = new Map();\n"
@@ -418,6 +502,12 @@ static const char *pljs_fdw_bootstrap_code =
     "    _ensureBackup() {\n"
     "      if (this._txBackup === null) {\n"
     "        this._txBackup = this._cloneMap();\n"
+    "      }\n"
+    "      if (this._subxactStack.length > 0) {\n"
+    "        const top = this._subxactStack[this._subxactStack.length - 1];\n"
+    "        if (top.snapshot === null) {\n"
+    "          top.snapshot = this._cloneMap();\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "    _normKey(val) {\n"
@@ -536,11 +626,44 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "    commit() {\n"
     "      this._txBackup = null;\n"
+    "      this._subxactStack = [];\n"
     "    }\n"
     "    rollback() {\n"
     "      if (this._txBackup !== null) {\n"
     "        this.map = this._txBackup;\n"
     "        this._txBackup = null;\n"
+    "      }\n"
+    "      this._subxactStack = [];\n"
+    "    }\n"
+    "    subxactStart(mySubid, parentSubid) {\n"
+    "      this._subxactStack.push({ subid: mySubid, parentSubid: parentSubid, snapshot: null });\n"
+    "    }\n"
+    "    subxactCommit(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        const entry = this._subxactStack.splice(idx, 1)[0];\n"
+    "        if (entry.snapshot !== null && idx > 0) {\n"
+    "          const parent = this._subxactStack[idx - 1];\n"
+    "          if (parent.snapshot === null) {\n"
+    "            parent.snapshot = entry.snapshot;\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    subxactAbort(mySubid, parentSubid) {\n"
+    "      const idx = this._subxactStack.findIndex(s => s.subid === mySubid);\n"
+    "      if (idx >= 0) {\n"
+    "        let restoreMap = null;\n"
+    "        for (let i = idx; i < this._subxactStack.length; i++) {\n"
+    "          if (this._subxactStack[i].snapshot !== null) {\n"
+    "            restoreMap = this._subxactStack[i].snapshot;\n"
+    "            break;\n"
+    "          }\n"
+    "        }\n"
+    "        this._subxactStack.length = idx;\n"
+    "        if (restoreMap !== null) {\n"
+    "          this.map = restoreMap;\n"
+    "        }\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -603,7 +726,7 @@ static const char *pljs_fdw_bootstrap_code =
     "    }\n"
     "    getRelSize(planContext) {\n"
     "      const hasKeyEq = planContext && Array.isArray(planContext.quals) &&\n"
-    "        planContext.quals.some(q => q.column === 'id' && q.op === '=');\n"
+    "        planContext.quals.some(q => q.column === 'id' && (q.op === '=' || q.op === 'IN'));\n"
     "      if (hasKeyEq) {\n"
     "        return { rows: 1, width: 72, startupCost: 0.05, totalCost: 0.5 };\n"
     "      }\n"
@@ -612,12 +735,33 @@ static const char *pljs_fdw_bootstrap_code =
     "        : this.defaultLimit;\n"
     "      return { rows: Math.max(1, n), width: 72, startupCost: 0.5, totalCost: 0.5 + Math.max(1, n) * 0.05 };\n"
     "    }\n"
+    "    getPathKeys(planContext) {\n"
+    "      return [{ column: 'id', ascending: true, nullsFirst: false }];\n"
+    "    }\n"
     "    lookupKey(key, request) {\n"
     "      const id = Number(key);\n"
     "      if (!Number.isInteger(id) || id < 1 || id > this.defaultLimit) return [];\n"
     "      const row = this._generatePerson(id);\n"
+    "      const filters = (request && request.filters) || [];\n"
+    "      if (!ForeignDataWrapper.matchFilters(row, filters)) return [];\n"
     "      const cols = (request && request.columns) || null;\n"
     "      return [ForeignDataWrapper.projectRow(row, cols)];\n"
+    "    }\n"
+    "    lookupKeys(keys, request) {\n"
+    "      const hasPushedLimit = (request && typeof request.limit === 'number' && request.limit >= 0);\n"
+    "      const targetCount = hasPushedLimit ? Math.min(request.limit, this.defaultLimit) : this.defaultLimit;\n"
+    "      if (targetCount <= 0) return [];\n"
+    "      const uniqueIds = Array.from(new Set(keys.map(v => Number(v)))).sort((a, b) => a - b);\n"
+    "      const out = [];\n"
+    "      for (let i = 0; i < uniqueIds.length; i++) {\n"
+    "        if (out.length >= targetCount) break;\n"
+    "        const found = this.lookupKey(uniqueIds[i], request);\n"
+    "        for (let j = 0; j < found.length; j++) {\n"
+    "          if (out.length >= targetCount) break;\n"
+    "          out.push(found[j]);\n"
+    "        }\n"
+    "      }\n"
+    "      return out;\n"
     "    }\n"
     "    *scan(request) {\n"
     "      const filters = (request && request.filters) || [];\n"
@@ -821,6 +965,44 @@ void pljs_fdw_xact_cb(XactEvent event, void *arg) {
         JS_FreeValue(ctx, JS_GetException(ctx));
       }
       JS_FreeValue(ctx, ret);
+    } else if (JS_IsException(fn)) {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, fn);
+  }
+}
+
+void pljs_fdw_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
+                         SubTransactionId parentSubid, void *arg) {
+  (void)arg;
+  if (event != SUBXACT_EVENT_START_SUB && event != SUBXACT_EVENT_COMMIT_SUB &&
+      event != SUBXACT_EVENT_ABORT_SUB) {
+    return;
+  }
+
+  const char *method_name =
+      (event == SUBXACT_EVENT_START_SUB)
+          ? "subxactStart"
+          : ((event == SUBXACT_EVENT_COMMIT_SUB) ? "subxactCommit"
+                                                 : "subxactAbort");
+
+  for (PljsFdwCachedWrapper *curr = pljs_fdw_wrapper_head; curr != NULL;
+       curr = curr->next) {
+    if (curr->ctx == NULL || JS_IsUndefined(curr->instance))
+      continue;
+    JSContext *ctx = curr->ctx;
+    JSValue fn = JS_GetPropertyStr(ctx, curr->instance, method_name);
+    if (JS_IsFunction(ctx, fn)) {
+      JSValue args[2] = {JS_NewInt32(ctx, (int32_t)mySubid),
+                         JS_NewInt32(ctx, (int32_t)parentSubid)};
+      JS_UpdateStackTop(JS_GetRuntime(ctx));
+      JSValue ret = JS_Call(ctx, fn, curr->instance, 2, args);
+      if (JS_IsException(ret)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+      }
+      JS_FreeValue(ctx, ret);
+      JS_FreeValue(ctx, args[0]);
+      JS_FreeValue(ctx, args[1]);
     } else if (JS_IsException(fn)) {
       JS_FreeValue(ctx, JS_GetException(ctx));
     }
@@ -1697,8 +1879,13 @@ static List *pljs_fdw_build_pathkeys(PlannerInfo *root, RelOptInfo *baserel,
     Var *var = makeVar(baserel->relid, matched_attr->attnum,
                        matched_attr->atttypid, matched_attr->atttypmod,
                        matched_attr->attcollation, 0);
+#if PG_VERSION_NUM >= 160000
     List *expr_pks = build_expression_pathkey(root, (Expr *)var, sort_op,
                                               baserel->relids, true);
+#else
+    List *expr_pks = build_expression_pathkey(root, (Expr *)var, NULL, sort_op,
+                                              baserel->relids, true);
+#endif
     if (expr_pks != NIL) {
       pathkeys = list_concat(pathkeys, expr_pks);
       PljsOrderBy *ob = &fpinfo->orderby[fpinfo->orderby_count++];
@@ -2543,6 +2730,25 @@ static PljsCacheEntry *pljs_fdw_lru_insert(PljsFdwScanState *festate,
   return entry;
 }
 
+static inline bool
+pljs_fdw_tuplestore_gettupleslot_force(Tuplestorestate *tstore, bool forward,
+                                       bool copy, TupleTableSlot *slot) {
+#if PG_VERSION_NUM >= 190000
+  return tuplestore_gettupleslot_force(tstore, forward, copy, slot);
+#else
+  TupleTableSlot *mslot = MakeSingleTupleTableSlot(slot->tts_tupleDescriptor,
+                                                   &TTSOpsMinimalTuple);
+  bool found = tuplestore_gettupleslot(tstore, forward, copy, mslot);
+  if (found) {
+    ExecCopySlot(slot, mslot);
+  } else {
+    ExecClearTuple(slot);
+  }
+  ExecDropSingleTupleTableSlot(mslot);
+  return found;
+#endif
+}
+
 static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
   PljsFdwScanState *festate = (PljsFdwScanState *)node->fdw_state;
   TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -2554,7 +2760,8 @@ static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
         festate->emitted_rows >= festate->pushed_limit) {
       return ExecClearTuple(slot);
     }
-    if (tuplestore_gettupleslot(festate->tuplestore, true, false, slot)) {
+    if (pljs_fdw_tuplestore_gettupleslot_force(festate->tuplestore, true, false,
+                                               slot)) {
       festate->emitted_rows++;
       return slot;
     }
@@ -2602,7 +2809,8 @@ static TupleTableSlot *pljs_fdw_iterate_foreign_scan(ForeignScanState *node) {
           festate->emitted_rows = 0;
           festate->stats_cache_hits++;
           pfree(param_key);
-          if (tuplestore_gettupleslot(festate->tuplestore, true, false, slot)) {
+          if (pljs_fdw_tuplestore_gettupleslot_force(festate->tuplestore, true,
+                                                     false, slot)) {
             festate->emitted_rows++;
             ret_slot = slot;
           } else {

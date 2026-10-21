@@ -81,6 +81,24 @@ FROM local_depts d
 JOIN ft_users u ON u.dept_id = d.dept_id
 ORDER BY d.dept_id, u.id;
 
+-- Parameterized & unparameterized Nested Loop Left Join rescan cache hits
+BEGIN;
+SET LOCAL enable_hashjoin = off;
+SET LOCAL enable_mergejoin = off;
+SET LOCAL enable_material = off;
+SELECT v.d_id, count(u.id) AS user_cnt
+FROM (VALUES (1), (2), (1)) AS v(d_id)
+LEFT JOIN ft_users u ON u.dept_id = v.d_id
+GROUP BY v.d_id
+ORDER BY v.d_id;
+
+SELECT v.d_id, count(u.id) AS user_cnt
+FROM (VALUES (1), (2), (3)) AS v(d_id)
+LEFT JOIN ft_users u ON (u.dept_id + v.d_id) > 0
+GROUP BY v.d_id
+ORDER BY v.d_id;
+COMMIT;
+
 -- 10. Transaction Rollback Coordination
 BEGIN;
 INSERT INTO ft_sessions (key, user_id, status, data)
@@ -89,6 +107,18 @@ SELECT key FROM ft_sessions WHERE key = 'sess:rollback_test';
 ROLLBACK;
 
 SELECT key FROM ft_sessions WHERE key = 'sess:rollback_test';
+
+-- Nested Savepoint Rollback on MapTableFdw
+BEGIN;
+INSERT INTO ft_sessions (key, user_id, status, data)
+VALUES ('sess:sp_keep', 701, 'active', '{}');
+SAVEPOINT sp_map;
+INSERT INTO ft_sessions (key, user_id, status, data)
+VALUES ('sess:sp_abort', 702, 'transient', '{}');
+ROLLBACK TO SAVEPOINT sp_map;
+COMMIT;
+SELECT key, user_id, status FROM ft_sessions WHERE key IN ('sess:sp_keep', 'sess:sp_abort') ORDER BY key;
+DELETE FROM ft_sessions WHERE key = 'sess:sp_keep';
 
 -- 11. Direct Modify Pushdown
 CREATE SERVER test_dm_srv FOREIGN DATA WRAPPER pljs_fdw OPTIONS (wrapper 'MapTableFdw', direct_modify 'true');
@@ -168,6 +198,23 @@ ROLLBACK;
 
 SELECT id, name FROM ft_temp_products WHERE id = 99;
 
+-- Nested Savepoint and Subtransaction Rollback Coordination
+BEGIN;
+INSERT INTO ft_temp_products (id, name, category, price, in_stock)
+VALUES (100, 'Tablet', 'electronics', 499.00, true);
+SAVEPOINT sp1;
+INSERT INTO ft_temp_products (id, name, category, price, in_stock)
+VALUES (101, 'Smartwatch', 'electronics', 249.00, true);
+SAVEPOINT sp2;
+INSERT INTO ft_temp_products (id, name, category, price, in_stock)
+VALUES (102, 'Fitness Band', 'electronics', 79.00, true);
+ROLLBACK TO SAVEPOINT sp2;
+SELECT id, name FROM ft_temp_products WHERE id IN (100, 101, 102) ORDER BY id;
+ROLLBACK TO SAVEPOINT sp1;
+SELECT id, name FROM ft_temp_products WHERE id IN (100, 101, 102) ORDER BY id;
+COMMIT;
+SELECT id, name FROM ft_temp_products WHERE id IN (100, 101, 102) ORDER BY id;
+
 -- 14. RandomPeopleFdw: Synthetic Personal Info Table with Limit Pushdown
 CREATE SERVER test_rand_srv FOREIGN DATA WRAPPER pljs_fdw OPTIONS (wrapper 'RandomPeopleFdw');
 
@@ -195,6 +242,21 @@ SELECT id, first_name, last_name, city FROM ft_random_people LIMIT 2;
 
 -- Point ID lookup pushdown
 SELECT id, first_name, last_name, email, age, city FROM ft_random_people WHERE id = 42;
+
+-- Point ID lookup with additional non-matching predicate (must return 0 rows)
+SELECT id, first_name, city FROM ft_random_people WHERE id = 42 AND city = 'Atlantis';
+
+-- Point ID lookup with matching predicate
+SELECT id, first_name, city FROM ft_random_people WHERE id = 42 AND city = 'Indianapolis';
+
+-- Batch IN list ID lookup with limit pushdown
+SELECT id, first_name FROM ft_random_people WHERE id IN (1, 5, 9999) LIMIT 2;
+
+-- Order by ID with pushed limit (sort elimination via pathkeys)
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id, first_name FROM ft_random_people ORDER BY id ASC LIMIT 5;
+
+SELECT id, first_name FROM ft_random_people ORDER BY id ASC LIMIT 5;
 
 -- Zero limit test (must return 0 rows)
 SELECT id FROM ft_random_people LIMIT 0;

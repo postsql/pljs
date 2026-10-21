@@ -144,3 +144,17 @@ CREATE OR REPLACE FUNCTION pljs_inline_helper_6() RETURNS SETOF record
  LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
 CREATE OR REPLACE FUNCTION pljs_inline_helper_7() RETURNS SETOF record
  LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+
+CREATE OR REPLACE FUNCTION pljs_fdw_handler() RETURNS fdw_handler
+ AS 'MODULE_PATHNAME', 'pljs_fdw_handler' LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION pljs_fdw_validator(text[], oid) RETURNS void
+ AS 'MODULE_PATHNAME', 'pljs_fdw_validator' LANGUAGE C STRICT;
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_foreign_data_wrapper WHERE fdwname = 'pljs_fdw') THEN
+    CREATE FOREIGN DATA WRAPPER pljs_fdw
+      HANDLER pljs_fdw_handler
+      VALIDATOR pljs_fdw_validator;
+  END IF;
+END $$;

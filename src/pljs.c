@@ -232,6 +232,7 @@ static void pljs_catalog_xact_cb(XactEvent event, void *arg) {
   if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT) {
     pljs_catalog_gen++;
   }
+  pljs_fdw_xact_cb(event, arg);
 }
 
 static void pljs_catalog_subxact_cb(SubXactEvent event,
